@@ -40,7 +40,7 @@ The `~/.config/claude-mux/config.toml` file listing the operator's **Projects** 
 A git worktree of a **Project**, checked out to its own directory (convention: `<repo>.worktrees/<branch_sanitized>`) on its own branch. Crucially, each Worktree is a *distinct* **Project Slug** to Claude Code and therefore has its own **Session Index**. One Project has many Worktrees.
 
 **Workspace**:
-A tmux **window** created by claude-mux for one **Worktree**, with a default layout: `claude` in a left vertical split, **yazi** top-right, a plain terminal bottom-right. A Worktree has *at most one* Workspace, but may have **none** (a Dormant Worktree exists on disk with no window).
+A full-screen tmux **window** in the `claude-mux` session (see **tmux mapping**), created by claude-mux for one **Worktree**, with a default layout: `claude` in a left vertical split, **yazi** top-right, a plain terminal bottom-right. A Worktree has *at most one* Workspace, but may have **none** (a Dormant Worktree exists on disk with no window).
 _Avoid_: "session" (collides with **Session**), "window" bare (too generic).
 
 **Worktree lifecycle** — a Worktree is in exactly one state:
@@ -49,13 +49,16 @@ _Avoid_: "session" (collides with **Session**), "window" bare (too generic).
 - **Live**: has a Workspace with a running Claude (a **Live Claude**).
 
 **Activate**:
-The action that takes a **Dormant** Worktree to **Live** (confirmed): build its **Workspace** and auto-launch `claude` in the left pane (`--resume` the most recent **Session** for that worktree's **Project Slug** if one exists, else fresh), then jump to it. Creating a **New Workspace** is "create the worktree, then Activate it" — Activate is the shared primitive.
+The action that takes a **Dormant** Worktree to **Live** (confirmed): build its **Workspace** and auto-launch `claude` in the left pane (`--resume` the most recent **Session** for that worktree's **Project Slug** if one exists, else fresh), then `select-window` to it (full-screen) within the `claude-mux` session and focus the `claude` pane. Creating a **New Workspace** is "create the worktree, then Activate it" — Activate is the shared primitive.
 
 **tmux mapping**:
-One tmux **session per Project**; each **Workspace** (Worktree) is a **window** within that session. tmux's own structure thus mirrors the Project → Worktree tree, and tmux becomes the persistence/grouping layer. (Confirmed. See ADR-0002.)
+claude-mux owns a **single dedicated tmux session** (`claude-mux`). Its **window 0 is the Menu**; each **Workspace** (Worktree) is a full-screen **window** in that same session. Navigation is `select-window` within the owned session (not a session-per-Project), and a session-scoped tmux binding returns to the Menu. The Project → Worktree grouping lives only in the **Menu** tree, not in tmux structure. Nothing outside claude-mux is touched. (Confirmed. Supersedes ADR-0002. See ADR-0005.)
+
+**Menu**:
+Window 0 of the `claude-mux` session — the Textual **Project → Worktree** tree from which the operator picks a Worktree to enter. Always survives; one tmux keystroke away from any **Workspace**.
 
 ## Flagged ambiguities
 
-- **"session"** collides across three meanings: (1) a Claude conversation, (2) a live `claude` process in a pane, (3) a tmux session/window. Resolution in progress: reserve **Session** for the Claude conversation, use **Live Claude** for the running process, and **Workspace** for the tmux window container. tmux's own "session" is referred to as "tmux session" explicitly.
+- **"session"** collides across three meanings: (1) a Claude conversation, (2) a live `claude` process in a pane, (3) a tmux session/window. Resolution in progress: reserve **Session** for the Claude conversation, use **Live Claude** for the running process, and **Workspace** for the tmux window container. tmux's own "session" is referred to as "tmux session" explicitly — and note there is now exactly one, the `claude-mux` session (see **tmux mapping**, ADR-0005), so a bare "tmux session" almost always means it.
 - **Spine of the main list** — RESOLVED (refined): the tree's backbone is **Projects → Worktrees** (a collapsible two-level tree). A **Live Claude** is a *status attribute* of a Worktree row, not the backbone itself. Worktrees with no Live Claude are still shown, offering "resume" of their most recent **Session**. (This supersedes the earlier "spine = Live Claudes / dormant in a separate view" framing.)
 - **Project management** — RESOLVED: adding a Project picks a folder via `yazi --cwd-file`, validates it is a git repo, dedupes it against existing entries, and appends it to the **Config**; removing a Project is confirm-gated and edits the Config only. Neither action touches the filesystem — removal never deletes the folder.

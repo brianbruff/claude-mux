@@ -2,7 +2,9 @@
 
 ## Status
 
-accepted
+superseded by ADR-0005 (encapsulated single-session model)
+
+> **Superseded 2026-07-03.** The operator wants everything encapsulated in claude-mux (Claude Squad model) rather than switching their client to external per-project sessions. See ADR-0005. The Project -> Worktree grouping now lives only in the menu tree, not in tmux sessions.
 
 ## Context & decision
 

@@ -193,3 +193,76 @@ def action_remove_project(self) -> None
     # remove_project(...) -> notify -> refresh. If no project selected: notify a hint, no-op.
 ```
 A small `ConfirmScreen(ModalScreen[bool])` with Yes/No buttons is acceptable.
+
+---
+
+## M8 — Jump surfacing + vim navigation
+
+### Resume/jump must bring the claude pane on-screen
+When the operator resumes/activates or jumps to a worktree, the target claude
+pane MUST become visible on their attached tmux client:
+- Cross-session: `tmux switch-client -t <project-session>` (the client may be
+  attached to a different session, e.g. the claude-mux one) AND
+  `select-window -t <session>:<window>` AND `select-pane` to the claude (left) pane.
+- Dashboard mode: switching the client's active window is enough — the claude
+  window replaces claude-mux in view.
+- Popup mode: after issuing the jump, the app must EXIT/close the popup so the
+  now-switched underlying window is visible (a display-popup overlay otherwise
+  stays on top).
+`jump_to` must target the correct client; verify the target window becomes the
+session's active window after the call.
+
+### hjkl vim navigation in the tree
+Add key bindings that mirror arrow-key tree navigation:
+- `j` → cursor down, `k` → cursor up
+- `l` → expand the current node (Project) / step into
+- `h` → collapse the current node / step to parent
+Must NOT hijack typing inside modal Inputs (BranchPrompt/PathPrompt) — letters
+typed in an Input go to the Input. Keep existing bindings (enter/n/r/x/g/q/a/d).
+
+---
+
+## M9 — Encapsulated single-session (Claude Squad model) — supersedes M8 jump
+
+ADR-0005 is authoritative. claude-mux owns ONE tmux session `claude-mux`; window 0
+is the Textual menu; each entered Worktree is a full-screen window in that session.
+NO switch-client to external/per-project sessions for navigation.
+
+### Launch / bootstrap (__main__.py + tmux.py)
+```
+MUX_SESSION = "claude-mux"
+def in_tmux() -> bool                       # bool(os.environ.get("TMUX"))
+# `claude-mux` (default/dashboard) must:
+#   - if the claude-mux session does not exist: create it with window 0 running the
+#     Textual menu (e.g. new-session -d -s claude-mux 'claude-mux _menu'), name window 0 'menu'.
+#   - place the operator in it: attach-session if outside tmux, else switch-client -t claude-mux.
+#   - a hidden '_menu' subcommand runs the Textual App in-place (it is already window 0).
+# Running the menu while already inside window 0 must NOT recurse/bootstrap again.
+```
+
+### Enter / Resume a Worktree (activate.py + app.py)
+```
+def open_or_select_workspace(project, worktree, config, resume=True) -> str
+    # In the claude-mux session: if a window named '<project>/<branch>' exists, select it;
+    # else create it with build_workspace_layout (claude LEFT | yazi TOP-RIGHT | terminal BOTTOM-RIGHT),
+    # launch claude in the left pane (resume-aware: --resume latest Session else config.claude_cmd).
+    # Then select-window (full-screen) + select-pane the claude pane. Returns the window target.
+# app.action_resume / action_enter call this. No switch-client anywhere here.
+```
+`build_workspace_layout`/`new_window` now target the fixed MUX_SESSION. `jump_to`
+is reduced to select-window(+select-pane) within MUX_SESSION.
+
+### Back to menu (tmux.py)
+```
+def install_menu_keybinding(session=MUX_SESSION) -> None
+    # session-scoped tmux binding to `select-window -t claude-mux:menu`, so it works while
+    # focus is in the claude pane. Discoverable + configurable; pick a safe default
+    # (e.g. `prefix + m`, and/or a no-prefix key). Document it in README + menu footer.
+```
+
+### Close Workspace
+`close_workspace` kills the Worktree's window in MUX_SESSION; window 0 (menu) always survives.
+
+### Retired
+Per-project session creation and cross-session `switch-client` navigation (ADR-0002/M8).
+Keep `_current_client` only if used for the one-time launch switch-client.

@@ -5,7 +5,7 @@ A TUI for observing and managing Claude Code work across tmux. See [CONTEXT.md](
 ## Guiding decisions (from ADRs)
 
 - **Python + Textual**, managed with `uv`, driving tmux via `libtmux`. ([ADR-0003](adr/0003-python-textual-stack.md))
-- **One tmux session per Project, one window (Workspace) per Worktree** — tmux is the persistence layer. ([ADR-0002](adr/0002-tmux-session-per-project.md))
+- **One dedicated `claude-mux` tmux session; menu is window 0, each Worktree is a full-screen window (Workspace) in it** — navigation is `select-window`, no cross-session `switch-client`; tmux is the persistence layer. ([ADR-0005](adr/0005-encapsulated-single-session.md), superseding [ADR-0002](adr/0002-tmux-session-per-project.md)'s session-per-Project model)
 - **Hybrid status**: jsonl/process authoritative, `capture-pane` scrape for extras, degrading gracefully. ([ADR-0001](adr/0001-hybrid-status-source.md))
 
 ## Milestones
@@ -82,6 +82,17 @@ Manage the **Project** list from the TUI. `config.py` becomes **read-write**: it
 - **Remove Project:** separately-confirmed; removes the entry from `config.toml` only — never deletes the folder or any git data.
 
 **Demo:** press `a`, pick a repo folder in yazi → it appears in the tree; press `d` on a Project, confirm → it drops from the list while the folder stays on disk.
+
+### M9 — Encapsulated single-session (Claude Squad model)
+
+Fold everything into one owned tmux session — **supersedes the ADR-0002/M8 per-project-session, cross-session `switch-client` navigation**. ([ADR-0005](adr/0005-encapsulated-single-session.md))
+
+- **Bootstrap:** `claude-mux` ensures the `claude-mux` session exists with the Menu (Textual tree) in window 0, then places the operator in it — `attach` if launched outside tmux, `switch-client` if inside. A hidden `_menu` subcommand runs the app in-place in window 0.
+- **Enter/Resume a Worktree:** create-or-select a full-screen window named `<project>/<branch>` in the `claude-mux` session, building the Workspace layout and launching claude (resume-aware) on first open; then `select-window` + `select-pane` the claude pane. No `switch-client` to external or per-project sessions.
+- **Back to menu:** a session-scoped tmux key binding runs `select-window -t claude-mux:menu`, so it works while focus is in the claude pane.
+- **Close Workspace:** `kill-window` in the `claude-mux` session; window 0 (menu) always survives.
+
+**Demo:** launch → menu; pick a Worktree → land full-screen in its claude pane; one keystroke back to the menu; close a Workspace and the menu is still there.
 
 ## Config (v1 — minimal)
 

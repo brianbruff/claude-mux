@@ -10,6 +10,7 @@ the Events File mtime so a ``waiting`` transition surfaces almost immediately.
 """
 from __future__ import annotations
 
+import threading
 from pathlib import Path
 from typing import Optional
 
@@ -18,10 +19,10 @@ from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.containers import Horizontal, Vertical
 from textual.screen import ModalScreen
-from textual.widgets import Button, Footer, Header, Input, Label, Tree
+from textual.widgets import Button, Footer, Header, Input, Label, Static, Tree
 
-from claude_mux import activate, panemap
-from claude_mux.config import Config
+from claude_mux import activate, panemap, picker
+from claude_mux.config import Config, add_project, load_config, remove_project
 from claude_mux.model import Activity, Lifecycle, LiveClaude, Project, Worktree
 from claude_mux.status import StatusEngine
 from claude_mux import tmux
@@ -170,6 +171,45 @@ class BranchPromptScreen(ModalScreen[Optional[str]]):
         self.dismiss(None)
 
 
+class PathPromptScreen(ModalScreen[Optional[str]]):
+    """Prompt for a project directory path; dismisses with the path or None.
+
+    The fallback for adding a project when ``yazi`` is not on PATH.
+    """
+
+    DEFAULT_CSS = """
+    PathPromptScreen {
+        align: center middle;
+    }
+    PathPromptScreen #dialog {
+        width: 60;
+        height: auto;
+        padding: 1 2;
+        border: round $accent;
+        background: $surface;
+    }
+    PathPromptScreen Label {
+        margin-bottom: 1;
+    }
+    """
+
+    BINDINGS = [Binding("escape", "cancel", "Cancel")]
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="dialog"):
+            yield Label("Project directory (git repo root):")
+            yield Input(placeholder="~/path/to/repo", id="path")
+
+    def on_mount(self) -> None:
+        self.query_one(Input).focus()
+
+    def on_input_submitted(self, event: Input.Submitted) -> None:
+        self.dismiss(event.value.strip() or None)
+
+    def action_cancel(self) -> None:
+        self.dismiss(None)
+
+
 class ConfirmScreen(ModalScreen[bool]):
     """Yes/No confirmation; dismisses True only on an explicit yes."""
 
@@ -240,12 +280,23 @@ class ClaudeMuxApp(App):
     """
 
     BINDINGS = [
-        Binding("enter", "jump", "Jump / Activate"),
+        Binding("enter", "jump", "Enter workspace"),
         Binding("n", "new", "New worktree"),
         Binding("r", "resume", "Resume"),
         Binding("x", "close", "Close workspace"),
+        Binding("a", "add_project", "Add project"),
+        Binding("d", "remove_project", "Remove project"),
         Binding("g", "refresh", "Refresh"),
         Binding("q", "quit", "Quit"),
+        # vim-style tree navigation. j/k mirror the arrow keys (kept off the
+        # footer to avoid clutter); l/h expand/collapse and are shown. Single
+        # letters are safe next to the modal Inputs: an Input consumes printable
+        # keys itself, so these never fire while a BranchPrompt/PathPrompt is
+        # focused (same as the existing n/r/x/a/d bindings).
+        Binding("j", "cursor_down", "Down", show=False),
+        Binding("k", "cursor_up", "Up", show=False),
+        Binding("l", "expand_node", "Expand / in"),
+        Binding("h", "collapse_node", "Collapse / out"),
     ]
 
     def __init__(self, config: Config, popup: bool = False):
@@ -256,6 +307,29 @@ class ClaudeMuxApp(App):
         self.engine = StatusEngine(config)
         self._projects: list[Project] = []
         self._events_mtime: float = 0.0
+        # Monotonic generation bumped whenever the engine is swapped (config
+        # add/remove). A refresh worker captures the generation current when it
+        # starts; _rebuild_tree drops any result whose generation is stale, so a
+        # slow in-flight snapshot taken against the OLD engine can never repaint
+        # over the new config (ADR-0001 races; findings on stale repaint).
+        self._refresh_gen: int = 0
+        # Serializes the config workers' load->modify->save->reload sequence.
+        # ``@work(thread=True, group="config")`` does NOT serialize threaded
+        # workers, so a concurrent add+remove could interleave their
+        # read-modify-write of config.toml and lose one update (last writer
+        # wins). Holding this lock across the whole mutation (including the
+        # reload/engine swap) makes the sequence atomic between the two workers.
+        self._config_lock = threading.Lock()
+        # Serializes the lifecycle workers' create-or-select of a Worktree's
+        # Workspace window. ``@work(thread=True, group="lifecycle")`` does NOT
+        # serialize threaded workers, so a double-tap of Enter (or Enter then a
+        # re-open) starts two threads that both run activate's check-then-act
+        # (find_window -> new_window) before either creates the window: both see
+        # none and both build a window, spawning a duplicate window + duplicate
+        # ``claude`` in the same worktree. Holding this lock across the whole
+        # lifecycle op makes the find/create atomic, so the second worker re-runs
+        # find_window under the lock and selects the now-existing window instead.
+        self._lifecycle_lock = threading.Lock()
         # NB: not ``self.tree`` — Textual's App defines a read-only ``tree``
         # property (the DOM debug tree), so we hold the widget under ``_tree``.
         self._tree: Tree | None = None
@@ -265,6 +339,9 @@ class ClaudeMuxApp(App):
     def compose(self) -> ComposeResult:
         yield Header()
         yield Tree("Projects", id="tree")
+        # Menu footer hint: the back-to-menu tmux binding works while focus is in
+        # the claude pane (a tmux binding, not a Textual one), so surface it here.
+        yield Static("enter a worktree → full-screen workspace · prefix + m returns here", id="menuhint")
         yield Footer()
 
     def on_mount(self) -> None:
@@ -284,14 +361,19 @@ class ClaudeMuxApp(App):
 
     @work(exclusive=True, thread=True, group="refresh")
     def _refresh_worker(self) -> None:
+        # Capture the generation BEFORE reading the engine: this ordering means
+        # a concurrent engine swap can only ever make our result look stale (and
+        # be dropped), never make a stale snapshot look current.
+        gen = self._refresh_gen
+        engine = self.engine
         try:
-            projects = self.engine.snapshot()
+            projects = engine.snapshot()
         except Exception as exc:  # engine failure must not kill the UI
             self.call_from_thread(
                 self.notify, f"refresh failed: {exc}", severity="warning"
             )
             return
-        self.call_from_thread(self._rebuild_tree, projects)
+        self.call_from_thread(self._rebuild_tree, projects, gen)
 
     def _watch_events(self) -> None:
         """Cheap tick: refresh only when the Events File has changed."""
@@ -309,30 +391,37 @@ class ClaudeMuxApp(App):
 
     # -- tree rendering ----------------------------------------------------- #
 
-    def _rebuild_tree(self, projects: list[Project]) -> None:
+    def _rebuild_tree(self, projects: list[Project], gen: int | None = None) -> None:
+        # Drop a stale snapshot: if a config edit swapped the engine after this
+        # worker started, its generation no longer matches and repainting it
+        # would flash the OLD project list back into the tree.
+        if gen is not None and gen != self._refresh_gen:
+            return
         self._projects = projects
         tree = self._tree
         if tree is None:
             return
 
         # Preserve the selection across the rebuild — either a Worktree leaf (by
-        # path) or a Project node (by name), so an auto-refresh never yanks the
-        # cursor back to the root while the operator is on a project row.
+        # path) or a Project node (by root path), so an auto-refresh never yanks
+        # the cursor back to the root while the operator is on a project row.
+        # Both keys are unique across projects (two repos may share a basename),
+        # so the cursor is restored to the exact row it was on.
         selected_path: Path | None = None
-        selected_project: str | None = None
+        selected_project: Path | None = None
         node = tree.cursor_node
         if node is not None:
             if isinstance(node.data, Worktree):
                 selected_path = node.data.path
             elif isinstance(node.data, Project):
-                selected_project = node.data.name
+                selected_project = node.data.root
 
         tree.clear()
         tree.root.expand()
         restore = None
         for project in projects:
             pnode = tree.root.add(project_label(project), data=project, expand=True)
-            if selected_project is not None and project.name == selected_project:
+            if selected_project is not None and project.root == selected_project:
                 restore = pnode
             for wt in project.worktrees:
                 wnode = pnode.add_leaf(worktree_label(wt), data=wt)
@@ -377,6 +466,16 @@ class ClaudeMuxApp(App):
         return None
 
     def _project_for(self, wt: Worktree) -> Optional[Project]:
+        # Match by object identity, not by name: the worktree stored on a tree
+        # node is the exact instance held in its parent Project's ``worktrees``
+        # list, so identity finds the true parent even when two configured repos
+        # share a directory basename (and thus a Project name). A name match
+        # would return the FIRST same-named project and, on remove, delete the
+        # wrong config entry.
+        for project in self._projects:
+            if any(w is wt for w in project.worktrees):
+                return project
+        # Fallback for any caller passing a reconstructed worktree.
         for project in self._projects:
             if project.name == wt.project_name:
                 return project
@@ -390,30 +489,62 @@ class ClaudeMuxApp(App):
         if isinstance(data, Worktree):
             self._jump_or_activate(data)
 
+    # -- vim tree navigation ------------------------------------------------ #
+
+    def action_cursor_down(self) -> None:
+        if self._tree is not None:
+            self._tree.action_cursor_down()
+
+    def action_cursor_up(self) -> None:
+        if self._tree is not None:
+            self._tree.action_cursor_up()
+
+    def action_expand_node(self) -> None:
+        """``l``: expand a collapsed node, else step into its first child."""
+        tree = self._tree
+        if tree is None:
+            return
+        node = tree.cursor_node
+        if node is None:
+            return
+        if node.allow_expand and not node.is_expanded:
+            node.expand()
+        else:
+            # Already expanded (or a leaf): step in / down to the next row.
+            tree.action_cursor_down()
+
+    def action_collapse_node(self) -> None:
+        """``h``: collapse an expanded node, else step out to its parent."""
+        tree = self._tree
+        if tree is None:
+            return
+        node = tree.cursor_node
+        if node is None:
+            return
+        if node.allow_expand and node.is_expanded:
+            node.collapse()
+        elif node.parent is not None and node.parent is not tree.root:
+            tree.move_cursor(node.parent)
+
     def action_jump(self) -> None:
         self._jump_or_activate(self._current_worktree())
 
     def _jump_or_activate(self, wt: Optional[Worktree]) -> None:
+        # M9 (ADR-0005): entering a Worktree is one primitive —
+        # open_or_select_workspace create-or-selects its window in the owned
+        # session. It is safe for every lifecycle: a DORMANT worktree gets a fresh
+        # Workspace, an OPEN/LIVE one is simply selected (no duplicate window).
         if wt is None:
             return
-        if wt.lifecycle is Lifecycle.DORMANT:
-            self._do_activate(wt, resume=True)
-        else:
-            self._do_jump(wt)
+        self._do_open_workspace(wt, resume=True)
 
     def action_resume(self) -> None:
         wt = self._current_worktree()
         if wt is None:
             return
-        # Only a DORMANT worktree needs activating (build Workspace + launch claude
-        # --resume). A worktree that already has a Workspace (OPEN/LIVE) must be
-        # jumped to, not re-activated — activating again would spawn a second,
-        # identically-named window and a duplicate claude attached to the same
-        # session. Mirrors the guard in _jump_or_activate.
-        if wt.lifecycle is Lifecycle.DORMANT:
-            self._do_activate(wt, resume=True)
-        else:
-            self._do_jump(wt)
+        # Same primitive; resume=True launches ``claude --resume`` when creating a
+        # fresh Workspace, and just selects an existing one.
+        self._do_open_workspace(wt, resume=True)
 
     def action_new(self) -> None:
         project = self._current_project()
@@ -444,46 +575,135 @@ class ClaudeMuxApp(App):
             on_confirm,
         )
 
+    # -- project management (edits config.toml only; never the filesystem) -- #
+
+    def _default_pick_start(self) -> Path:
+        """Sensible starting directory for the picker: parent of the first
+        configured project, else the home directory."""
+        if self.config.projects:
+            return self.config.projects[0].expanduser().parent
+        return Path.home()
+
+    def action_add_project(self) -> None:
+        # yazi picker (suspends the TUI while the operator browses) when
+        # available; otherwise a plain text-input fallback.
+        if picker.yazi_available():
+            path = picker.pick_directory(self, start=self._default_pick_start())
+            if path is not None:
+                self._commit_add_project(path)
+            return
+
+        def on_path(value: Optional[str]) -> None:
+            if value:
+                self._commit_add_project(Path(value))
+
+        self.push_screen(PathPromptScreen(), on_path)
+
+    @work(thread=True, group="config")
+    def _commit_add_project(self, path: Path) -> None:
+        # Off the UI thread: add_project shells out to ``git rev-parse`` and
+        # writes config.toml (fsync). Both can block on a slow/NFS filesystem, so
+        # they must never run on the event loop. A write failure (read-only fs,
+        # disk full) is caught and surfaced instead of crashing the TUI.
+        # Serialized against the remove worker so the two never interleave their
+        # load->modify->save of config.toml (which would lose an update).
+        with self._config_lock:
+            try:
+                added, message = add_project(path)
+            except Exception as exc:
+                self.call_from_thread(
+                    self.notify, f"add project failed: {exc}", severity="error"
+                )
+                return
+            self.call_from_thread(
+                self.notify, message, severity="information" if added else "warning"
+            )
+            if added:
+                self._reload_config()
+
+    def action_remove_project(self) -> None:
+        project = self._current_project()
+        if project is None:
+            self.notify("Select a project to remove", severity="warning")
+            return
+
+        def on_confirm(ok: bool) -> None:
+            if ok:
+                self._commit_remove_project(project)
+
+        self.push_screen(
+            ConfirmScreen(
+                f"Remove project '{project.name}' from claude-mux? "
+                "(the folder is NOT deleted)"
+            ),
+            on_confirm,
+        )
+
+    @work(thread=True, group="config")
+    def _commit_remove_project(self, project: Project) -> None:
+        # Off the UI thread: remove_project reads and rewrites config.toml
+        # (fsync). A write failure is surfaced rather than crashing the TUI.
+        # Serialized against the add worker so the two never interleave their
+        # load->modify->save of config.toml (which would lose an update).
+        with self._config_lock:
+            try:
+                removed = remove_project(project.root)
+            except Exception as exc:
+                self.call_from_thread(
+                    self.notify, f"remove project failed: {exc}", severity="error"
+                )
+                return
+            if removed:
+                self.call_from_thread(self.notify, f"Removed project: {project.name}")
+                self._reload_config()
+            else:
+                self.call_from_thread(
+                    self.notify,
+                    f"Project not found in config: {project.name}",
+                    severity="warning",
+                )
+
+    def _reload_config(self) -> None:
+        """Reload config from disk after a config edit (runs on a config worker
+        thread). The blocking TOML read happens here; the engine swap and tree
+        refresh are marshalled back to the UI thread so the generation bump and
+        engine reassignment stay atomic w.r.t. the refresh worker."""
+        config = load_config()
+        self.call_from_thread(self._apply_config, config)
+
+    def _apply_config(self, config: Config) -> None:
+        """UI thread: adopt the reloaded config, bumping the refresh generation
+        so any snapshot already in flight against the old engine is discarded."""
+        self.config = config
+        self.engine = StatusEngine(config)
+        self._refresh_gen += 1
+        self._trigger_refresh()
+
     # -- worker-thread lifecycle operations --------------------------------- #
 
     @work(thread=True, group="lifecycle")
-    def _do_jump(self, wt: Worktree) -> None:
+    def _do_open_workspace(self, wt: Worktree, resume: bool = True) -> None:
+        # M9 (ADR-0005): create-or-select the Worktree's window in the owned
+        # ``claude-mux`` session and select-window (full-screen) + select-pane the
+        # claude pane. No switch-client. Resolve the owning Project for the
+        # ``<project>/<branch>`` window name; fall back to a minimal Project built
+        # from the worktree if identity lookup fails.
         try:
-            if wt.live is not None:
-                tmux.jump_to(wt.live.session_name, pane_id=wt.live.pane_id)
-            else:
+            with self._lifecycle_lock:
                 project = self._project_for(wt)
-                session = (
-                    (project.session_name or project.name)
-                    if project is not None
-                    else wt.project_name
-                )
-                # An OPEN worktree has a Workspace window but no running claude, so
-                # there is no pane to target. Switching Worktrees is a window switch
-                # (ADR-0002): select that worktree's window, session-qualified so the
-                # bare branch name never resolves against another project's session.
-                window = activate._window_name(wt)
-                tmux.jump_to(session, window_target=f"{session}:{window}")
+                if project is None:
+                    project = Project(name=wt.project_name, root=wt.path)
+                activate.open_or_select_workspace(project, wt, self.config, resume=resume)
         except Exception as exc:
-            self.call_from_thread(self.notify, f"jump failed: {exc}", severity="error")
-            return
-        self._after_navigation()
-
-    @work(thread=True, group="lifecycle")
-    def _do_activate(self, wt: Worktree, resume: bool = True) -> None:
-        try:
-            activate.activate(wt, self.config, resume=resume)
-        except Exception as exc:
-            self.call_from_thread(
-                self.notify, f"activate failed: {exc}", severity="error"
-            )
+            self.call_from_thread(self.notify, f"open failed: {exc}", severity="error")
             return
         self._after_navigation()
 
     @work(thread=True, group="lifecycle")
     def _do_new_worktree(self, project: Project, branch: str) -> None:
         try:
-            activate.new_worktree(project, branch, self.config)
+            with self._lifecycle_lock:
+                activate.new_worktree(project, branch, self.config)
         except Exception as exc:
             self.call_from_thread(
                 self.notify, f"new worktree failed: {exc}", severity="error"
@@ -493,8 +713,11 @@ class ClaudeMuxApp(App):
 
     @work(thread=True, group="lifecycle")
     def _do_close(self, wt: Worktree) -> None:
+        # Same lock as open/create: a close must not interleave with an in-flight
+        # open of the same Worktree (kill racing create), and vice versa.
         try:
-            activate.close_workspace(wt)
+            with self._lifecycle_lock:
+                activate.close_workspace(wt)
         except Exception as exc:
             self.call_from_thread(self.notify, f"close failed: {exc}", severity="error")
             return

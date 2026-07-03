@@ -1,33 +1,57 @@
-"""Lifecycle primitives: activate a Worktree into a running Workspace + Claude.
+"""Lifecycle primitives: open a Worktree into a Workspace window + Claude.
 
-Activate is the shared lifecycle primitive (see CONTEXT.md / ADR-0002): it takes a
-Dormant Worktree (on disk, no tmux window) to Live by building its Workspace — one
-tmux window inside the Project's tmux session — and auto-launching ``claude`` in the
-left pane, resuming the worktree's most recent Session when one exists.
+claude-mux owns ONE tmux session (see ADR-0005 / M9). Each entered Worktree is a
+full-screen window named ``<project>/<branch>`` in that session, carrying the
+three-pane Workspace layout (claude-left / yazi-top-right / shell-bottom-right)
+with ``claude`` auto-launched (resume-aware) in the left pane.
+
+``open_or_select_workspace`` is the shared primitive: it create-or-selects the
+Worktree's window and ``select-window``s to it (full-screen) — no ``switch-client``.
 
 Layering:
-  * ``new_worktree`` = create the git worktree, then ``activate`` it.
+  * ``new_worktree`` = create the git worktree, then open its Workspace.
   * ``close_workspace`` tears down only the tmux window (Live/Open -> Dormant); it
-    NEVER touches git.
+    NEVER touches git. The menu window (window 0) always survives.
   * ``remove_worktree`` is the distinct, destructive git teardown; callers confirm.
 """
 from __future__ import annotations
+
+import hashlib
 
 from claude_mux import git, sessions, tmux
 from claude_mux.config import Config
 from claude_mux.model import Lifecycle, Project, Worktree
 
 
-def _window_name(worktree: Worktree) -> str:
-    """tmux window name for a Worktree's Workspace (stable + filesystem-safe).
+def _workspace_window_name(project_name: str, worktree: Worktree) -> str:
+    """tmux window name for a Worktree's Workspace: ``<project>/<branch>-<id>``.
 
-    Uses the sanitized branch so the same Worktree always resolves to the same
-    window target for both ``new_window`` and ``kill_window``. Falls back to the
-    worktree directory name when the branch is empty (e.g. detached HEAD).
+    Grouping is UI-only now (ADR-0005): the project prefix keeps windows legible
+    within the single owned session. Two properties are load-bearing for correct
+    ``find_window``/``kill_window`` targeting:
+
+    * **Round-trips as a tmux target.** The branch is passed through
+      ``git.sanitize_branch`` so a ``.`` (tmux's ``window.pane`` separator) or
+      ``:`` (its ``session:window`` separator) can never make ``session:<name>``
+      misparse — e.g. branch ``release-2.5`` would otherwise create a window that
+      ``kill_window`` cannot target (tmux reads ``.5`` as a pane index), leaking
+      the window while the Worktree is flipped DORMANT. The project prefix is
+      sanitized for the same reason.
+    * **Globally unique per Worktree.** ``<project>/<branch>`` alone collides when
+      two configured repos share a directory basename (Project.name is the dir
+      basename) and hold the same branch, so ``find_window`` dedup would select
+      the wrong project's window. A short digest of the Worktree's (unique) path
+      disambiguates — the same key the app uses to tell same-basename Projects
+      apart by identity (app._project_for). The digest is stable, so create and
+      select/close all resolve to the same window.
+
+    Falls back to the worktree directory name when the branch is empty (e.g.
+    detached HEAD).
     """
-    if worktree.branch:
-        return git.sanitize_branch(worktree.branch)
-    return worktree.path.name
+    branch = worktree.branch or worktree.path.name
+    disambiguator = hashlib.sha1(str(worktree.path).encode()).hexdigest()[:8]
+    project = git.sanitize_branch(project_name)
+    return f"{project}/{git.sanitize_branch(branch)}-{disambiguator}"
 
 
 def _claude_command(worktree: Worktree, config: Config, resume: bool) -> str:
@@ -37,24 +61,50 @@ def _claude_command(worktree: Worktree, config: Config, resume: bool) -> str:
     return config.claude_cmd
 
 
-def activate(worktree: Worktree, config: Config, resume: bool = True) -> None:
-    """Build the Workspace for a Worktree and launch (optionally resume) claude, then jump.
+def _open_or_select(project_name: str, worktree: Worktree, config: Config, resume: bool) -> str:
+    """Create-or-select the Worktree's Workspace window in the owned session.
 
-    One tmux session per Project (name == ``worktree.project_name``); the Workspace is a
-    new window in that session laid out as claude-left / yazi-top-right / shell-bottom-right.
-    The left pane runs ``claude --resume <session_id>`` when ``resume`` is set and the
-    worktree has a most-recent Session, otherwise ``config.claude_cmd``. Finally jump to it.
+    If a window named ``<project>/<branch>`` already exists, ``select-window`` to
+    it (a second entry never spawns a duplicate window/claude). Otherwise build
+    the three-pane layout, launch claude (resume-aware) in the left pane, then
+    ``select-window`` (full-screen) + ``select-pane`` the claude pane. Returns the
+    window target (``@``-prefixed window id). No ``switch-client`` anywhere.
     """
-    session_name = worktree.project_name
-    claude_cmd = _claude_command(worktree, config, resume)
+    tmux.ensure_menu_session()  # idempotent; guarantees the owned session exists
+    name = _workspace_window_name(project_name, worktree)
 
-    tmux.ensure_session(session_name, worktree.path)
-    window_target = tmux.new_window(session_name, _window_name(worktree), worktree.path)
-    tmux.build_workspace_layout(session_name, window_target, worktree.path, claude_cmd)
+    existing = tmux.find_window(tmux.MUX_SESSION, name)
+    if existing is not None:
+        tmux.jump_to(tmux.MUX_SESSION, window_target=existing)
+        return existing
+
+    claude_cmd = _claude_command(worktree, config, resume)
+    window_target = tmux.new_window(tmux.MUX_SESSION, name, worktree.path)
+    layout = tmux.build_workspace_layout(tmux.MUX_SESSION, window_target, worktree.path, claude_cmd)
 
     worktree.lifecycle = Lifecycle.LIVE
+    tmux.jump_to(tmux.MUX_SESSION, window_target=window_target, pane_id=layout.get("claude"))
+    return window_target
 
-    tmux.jump_to(session_name, window_target)
+
+def open_or_select_workspace(
+    project: Project, worktree: Worktree, config: Config, resume: bool = True
+) -> str:
+    """M9 entry primitive: open (create) or select the Worktree's Workspace window.
+
+    Full-screen swap within the owned ``claude-mux`` session (ADR-0005). Returns
+    the window target.
+    """
+    return _open_or_select(project.name, worktree, config, resume)
+
+
+def activate(worktree: Worktree, config: Config, resume: bool = True) -> None:
+    """Open (or select) a Worktree's Workspace in the owned session.
+
+    Compatibility wrapper over ``open_or_select_workspace`` for callers that only
+    hold the Worktree (its ``project_name`` names the window prefix).
+    """
+    _open_or_select(worktree.project_name, worktree, config, resume)
 
 
 def new_worktree(project: Project, branch: str, config: Config) -> Worktree:
@@ -75,7 +125,7 @@ def new_worktree(project: Project, branch: str, config: Config) -> Worktree:
         lifecycle=Lifecycle.DORMANT,
     )
 
-    activate(worktree, config)
+    open_or_select_workspace(project, worktree, config)
     return worktree
 
 
@@ -86,7 +136,7 @@ def close_workspace(worktree: Worktree) -> None:
     ``kill_window`` are swallowed so closing an already-gone Workspace is a no-op.
     """
     try:
-        tmux.kill_window(worktree.project_name, _window_name(worktree))
+        tmux.kill_window(tmux.MUX_SESSION, _workspace_window_name(worktree.project_name, worktree))
     except Exception:
         # The Workspace may already be gone; closing is idempotent. Never touch git.
         pass

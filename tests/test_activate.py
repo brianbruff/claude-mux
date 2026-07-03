@@ -1,8 +1,14 @@
-"""Focused unit tests for claude_mux.activate orchestration.
+"""Focused unit tests for claude_mux.activate orchestration (M9 / ADR-0005).
 
 These exercise the lifecycle wiring with tmux/git stubbed out, asserting the
-safety-critical invariants: resume-command construction, lifecycle transitions,
-close_workspace never touching git, and remove_worktree being the only git teardown.
+safety-critical invariants: the single owned session + ``<project>/<branch>``
+window naming, create-or-select (no duplicate window on re-entry), resume-command
+construction, lifecycle transitions, close_workspace never touching git, and
+remove_worktree being the only git teardown.
+
+The tmux surface is fully stubbed so NO real tmux server is ever touched here.
+``ensure_menu_session``/``find_window`` are stubbed alongside the rest precisely
+so a unit run can never create the ``claude-mux`` session on the default server.
 """
 from __future__ import annotations
 
@@ -11,6 +17,7 @@ from pathlib import Path
 import pytest
 
 from claude_mux import activate as activate_mod
+from claude_mux import tmux as tmux_mod
 from claude_mux.config import Config
 from claude_mux.model import Lifecycle, Project, SessionMeta, Worktree
 
@@ -21,28 +28,38 @@ class Recorder:
     def __init__(self, log: list, git_calls: list):
         self.log = log
         self.git_calls = git_calls
+        # Window name -> window id, so find_window can simulate an existing window.
+        self.existing_windows: dict[str, str] = {}
 
     # tmux surface -------------------------------------------------
-    def ensure_session(self, session_name, cwd):
-        self.log.append(("ensure_session", session_name, cwd))
+    def ensure_menu_session(self, menu_cmd=None):
+        self.log.append(("ensure_menu_session",))
+
+    def find_window(self, session_name, window_name):
+        self.log.append(("find_window", session_name, window_name))
+        return self.existing_windows.get(window_name)
 
     def new_window(self, session_name, window_name, cwd):
         self.log.append(("new_window", session_name, window_name, cwd))
-        return f"{session_name}:{window_name}"
+        return f"@{window_name}"
 
     def build_workspace_layout(self, session_name, window_target, cwd, claude_cmd):
         self.log.append(("build_workspace_layout", session_name, window_target, cwd, claude_cmd))
         return {"claude": "%1", "yazi": "%2", "shell": "%3"}
 
     def jump_to(self, session_name, window_target=None, pane_id=None):
-        self.log.append(("jump_to", session_name, window_target))
+        self.log.append(("jump_to", session_name, window_target, pane_id))
 
     def kill_window(self, session_name, window_target):
         self.log.append(("kill_window", session_name, window_target))
 
     # git surface --------------------------------------------------
     def sanitize_branch(self, branch):
-        return branch.replace("/", "_")
+        # Mirror the real git.sanitize_branch: '/', '.' and ':' all break a tmux
+        # session:window target, so all three are replaced.
+        for ch in ("/", ".", ":"):
+            branch = branch.replace(ch, "_")
+        return branch
 
     def add_worktree(self, project_root, branch, pattern, base):
         self.git_calls.append(("add_worktree", project_root, branch, pattern, base))
@@ -56,12 +73,22 @@ class Recorder:
         return str(path).replace("/", "-")
 
 
+MUX = "claude-mux"
+
+
 @pytest.fixture
 def wired(monkeypatch):
     log: list = []
     git_calls: list = []
     rec = Recorder(log, git_calls)
-    for name in ("ensure_session", "new_window", "build_workspace_layout", "jump_to", "kill_window"):
+    for name in (
+        "ensure_menu_session",
+        "find_window",
+        "new_window",
+        "build_workspace_layout",
+        "jump_to",
+        "kill_window",
+    ):
         monkeypatch.setattr(activate_mod.tmux, name, getattr(rec, name))
     for name in ("sanitize_branch", "add_worktree", "remove_worktree"):
         monkeypatch.setattr(activate_mod.git, name, getattr(rec, name))
@@ -75,16 +102,50 @@ def _worktree(**kw):
     return Worktree(**base)
 
 
-def test_activate_fresh_when_no_session(wired):
+def test_activate_fresh_when_no_window(wired):
     wt = _worktree()
     cfg = Config(projects=[], claude_cmd="claude")
     activate_mod.activate(wt, cfg)
 
     kinds = [c[0] for c in wired.log]
-    assert kinds == ["ensure_session", "new_window", "build_workspace_layout", "jump_to"]
+    assert kinds == [
+        "ensure_menu_session",
+        "find_window",
+        "new_window",
+        "build_workspace_layout",
+        "jump_to",
+    ]
+    # Everything targets the single owned session.
+    nw = next(c for c in wired.log if c[0] == "new_window")
+    assert nw[1] == MUX
     layout = next(c for c in wired.log if c[0] == "build_workspace_layout")
     assert layout[4] == "claude"  # fresh, no --resume
+    # Final jump selects the workspace window AND the claude pane, no switch-client.
+    # The window target is the id captured from new_window (name-derived), whatever
+    # the exact sanitized+disambiguated name is.
+    name = activate_mod._workspace_window_name("proj", wt)
+    jump = next(c for c in wired.log if c[0] == "jump_to")
+    assert jump == ("jump_to", MUX, f"@{name}", "%1")
     assert wt.lifecycle is Lifecycle.LIVE
+
+
+def test_open_or_select_selects_existing_no_duplicate(wired):
+    # A window for this worktree already exists -> select it, never create a new
+    # window or launch a second claude.
+    wt = _worktree()
+    project = Project(name="proj", root=Path("/repo"))
+    wired.existing_windows[activate_mod._workspace_window_name("proj", wt)] = "@already"
+    cfg = Config(projects=[], claude_cmd="claude")
+
+    target = activate_mod.open_or_select_workspace(project, wt, cfg)
+
+    assert target == "@already"
+    kinds = [c[0] for c in wired.log]
+    assert kinds == ["ensure_menu_session", "find_window", "jump_to"]
+    assert not any(c[0] == "new_window" for c in wired.log)
+    assert not any(c[0] == "build_workspace_layout" for c in wired.log)
+    jump = next(c for c in wired.log if c[0] == "jump_to")
+    assert jump == ("jump_to", MUX, "@already", None)
 
 
 def test_activate_resumes_latest_session(wired):
@@ -124,12 +185,36 @@ def test_activate_uses_custom_claude_cmd(wired):
     assert layout[4] == "my-claude --flag"
 
 
-def test_window_name_uses_sanitized_branch(wired):
+def test_window_name_is_project_slash_branch(wired):
     wt = _worktree(branch="feature/x")
     cfg = Config(projects=[])
     activate_mod.activate(wt, cfg)
     nw = next(c for c in wired.log if c[0] == "new_window")
-    assert nw[2] == "feature_x"
+    # UI-only grouping: <project>/<sanitized-branch>-<path-digest>. The branch is
+    # sanitized (so a '.'/':' cannot make session:<name> misparse) and a stable
+    # per-path digest suffix keeps the name unique across same-basename Projects.
+    assert nw[2].startswith("proj/feature_x-")
+    assert "/" not in nw[2].split("/", 1)[1]  # no raw slash survives in the branch part
+    assert nw[2] == activate_mod._workspace_window_name("proj", wt)
+
+
+def test_window_name_sanitizes_dotted_branch(wired):
+    # A branch like 'release-2.5' must not leave a '.' in the window name, or
+    # kill_window's 'session:<name>' target would misparse '.5' as a pane index
+    # and the window would leak while the worktree is flipped DORMANT.
+    wt = _worktree(branch="release-2.5")
+    name = activate_mod._workspace_window_name("proj", wt)
+    assert "." not in name
+    assert name.startswith("proj/release-2_5-")
+
+
+def test_window_name_unique_across_same_basename_projects():
+    # Two configured repos share a directory basename ('api') and hold the same
+    # branch ('main'); their Worktrees live at different paths, so the window
+    # names must differ (else find_window dedup selects the wrong project's window).
+    wt_a = Worktree(project_name="api", path=Path("/home/a/api"), branch="main")
+    wt_b = Worktree(project_name="api", path=Path("/home/b/api"), branch="main")
+    assert activate_mod._workspace_window_name("api", wt_a) != activate_mod._workspace_window_name("api", wt_b)
 
 
 def test_new_worktree_creates_then_activates(wired):
@@ -151,7 +236,10 @@ def test_close_workspace_never_touches_git(wired):
     activate_mod.close_workspace(wt)
 
     assert wired.git_calls == []  # git untouched
-    assert ("kill_window", "proj", "feature_x") in wired.log
+    # Kills the worktree's window in the owned session; menu window 0 survives.
+    # close_workspace must derive the SAME name open used (find/create/kill agree).
+    name = activate_mod._workspace_window_name(wt.project_name, wt)
+    assert ("kill_window", MUX, name) in wired.log
     assert wt.lifecycle is Lifecycle.DORMANT
     assert wt.live is None
 

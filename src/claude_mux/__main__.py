@@ -10,7 +10,10 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="claude-mux", description="tmux + git-worktree dashboard for Claude Code")
     sub = parser.add_subparsers(dest="command")
 
-    sub.add_parser("dashboard", help="run the Textual dashboard (default)")
+    sub.add_parser("dashboard", help="bootstrap the claude-mux session and enter its menu (default)")
+    # Hidden: runs the Textual menu in-place as window 0's process (no bootstrap,
+    # so it cannot recurse). Invoked by the session's window-0 command.
+    sub.add_parser("_menu")
     sub.add_parser("popup", help="run the dashboard in popup mode (jump closes it)")
     sub.add_parser("install-hooks", help="install claude-mux hooks into ~/.claude/settings.json")
     sub.add_parser("uninstall-hooks", help="remove claude-mux hooks from ~/.claude/settings.json")
@@ -22,6 +25,14 @@ def main(argv: list[str] | None = None) -> int:
     command = args.command or "dashboard"
 
     if command == "dashboard":
+        # Bootstrap the owned session (window 0 = menu) and place the operator in
+        # it: exec `tmux attach` when outside tmux, else switch-client. The menu
+        # itself runs as window 0's process via the hidden `_menu` subcommand, so
+        # this path does NOT run the Textual app directly (avoids recursion).
+        from claude_mux import tmux
+
+        tmux.bootstrap()
+    elif command == "_menu":
         from claude_mux.app import run_dashboard
         from claude_mux.config import load_config
 

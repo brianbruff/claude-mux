@@ -9,8 +9,18 @@ from claude_mux.model import Lifecycle, Worktree
 
 
 def sanitize_branch(branch: str) -> str:
-    """Sanitize a branch name for filesystem use ('/' -> '_')."""
-    return branch.replace("/", "_")
+    """Sanitize a branch name for filesystem and tmux-target use.
+
+    Replaces every character that breaks a ``session:window`` tmux target with
+    ``_``: ``/`` (path separator), ``.`` (tmux's ``window.pane`` separator) and
+    ``:`` (tmux's ``session:window`` separator). Sanitizing these means the name
+    round-trips — a window CREATED via ``new-window -n <name>`` can later be
+    referenced by ``session:<name>`` (jump, kill) without tmux misparsing a dot
+    as a pane index (e.g. ``feature.x`` -> window ``feature`` + pane ``x``).
+    """
+    for ch in ("/", ".", ":"):
+        branch = branch.replace(ch, "_")
+    return branch
 
 
 def _run_git(cwd: Path, *args: str) -> str:

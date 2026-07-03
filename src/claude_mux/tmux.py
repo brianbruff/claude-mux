@@ -1,18 +1,34 @@
 """tmux interaction via libtmux (pane listing, capture, layout, navigation).
 
-One tmux session per Project, one window (Workspace) per Worktree (see ADR-0002).
-A Workspace window has three panes: ``claude`` in a left vertical split (~50%),
-``yazi`` top-right, and a plain shell bottom-right.
+claude-mux owns ONE dedicated tmux session, ``claude-mux`` (see ADR-0005). Its
+window 0 is the ``menu`` (the Textual Project→Worktree tree); each entered
+Worktree is a full-screen window in that same session carrying the three-pane
+Workspace layout: ``claude`` in a left vertical split (~50%), ``yazi`` top-right,
+and a plain shell bottom-right. Navigation is ``select-window`` within the owned
+session — there is no ``switch-client`` to external/per-project sessions.
 """
 from __future__ import annotations
 
+import os
 import re
+import shlex
+import sys
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
 
 import libtmux
 from libtmux.constants import PaneDirection
+
+
+# The single dedicated tmux session claude-mux owns (ADR-0005). Module-level so
+# tests can monkeypatch it to a throwaway name before touching a live server.
+MUX_SESSION = "claude-mux"
+
+# Optional private socket name (``tmux -L <name>`` / ``libtmux.Server(socket_name=)``).
+# None => the operator's default server. Tests inject a private socket here so
+# live-tmux work never touches the operator's real default server.
+_SOCKET_NAME: Optional[str] = None
 
 
 @dataclass
@@ -35,8 +51,19 @@ _SEMVER_RE = re.compile(r"^v?\d+\.\d+(?:\.\d+)*$")
 
 
 def _server() -> libtmux.Server:
-    """Return a handle to the default tmux server (does not start it)."""
+    """Return a handle to the tmux server (does not start it).
+
+    Honors ``_SOCKET_NAME`` so a private socket can be injected for tests
+    (``libtmux.Server(socket_name=...)``); falls back to the default server.
+    """
+    if _SOCKET_NAME:
+        return libtmux.Server(socket_name=_SOCKET_NAME)
     return libtmux.Server()
+
+
+def in_tmux() -> bool:
+    """True when running inside a tmux client (``$TMUX`` is set)."""
+    return bool(os.environ.get("TMUX"))
 
 
 def _get_session(server: libtmux.Server, session_name: str) -> Optional[libtmux.Session]:
@@ -213,16 +240,183 @@ def build_workspace_layout(session_name: str, window_target: str, cwd: Path, cla
     }
 
 
-def jump_to(session_name: str, window_target: str | None = None, pane_id: str | None = None) -> None:
-    """Switch client to a session/window/pane (works from inside a display-popup).
+def find_window(session_name: str, window_name: str) -> str | None:
+    """Return the window id of an EXACT-named window in a session, else None.
 
-    Uses raw tmux commands so the caller's attached client (including the client
-    behind a ``display-popup``) is the one that gets switched.
+    tmux resolves bare names with fnmatch/prefix matching, so a Workspace name
+    like ``proj/feature/foo`` could match the wrong window. Compare names
+    exactly and return the unambiguous ``@``-prefixed window id for later
+    targeting.
+    """
+    server = _server()
+    if not server.is_alive():
+        return None
+    try:
+        out = server.cmd(
+            "list-windows", "-t", session_name,
+            "-F", "#{window_id}\t#{window_name}",
+        ).stdout
+    except Exception:
+        return None
+    for line in out:
+        wid, _, name = line.partition("\t")
+        if name == window_name:
+            return wid
+    return None
+
+
+def _menu_command() -> str:
+    """Shell command run as window 0's process: the in-place Textual menu.
+
+    Uses ``_menu`` (not ``dashboard``) so it does NOT re-bootstrap/recurse. Built
+    from ``sys.executable`` (mirrors hooks.hook_command) so it works under uv/venv.
+    """
+    return f"{shlex.quote(sys.executable)} -m claude_mux _menu"
+
+
+def ensure_menu_session(menu_cmd: str | None = None) -> None:
+    """Ensure the owned session exists with a ``menu`` window (idempotent).
+
+    Guard from the ADR contract: create the session when absent; if it exists but
+    has no ``menu`` window (stale/foreign), add one. Never attaches or switches a
+    client — placement is ``bootstrap``'s job. ``menu_cmd`` runs AS the menu
+    window's process (if it exits the window closes), so callers pass a foreground
+    command; defaults to the in-place Textual menu.
+    """
+    if menu_cmd is None:
+        menu_cmd = _menu_command()
+    server = _server()
+    if not (server.is_alive() and server.has_session(MUX_SESSION)):
+        server.cmd("new-session", "-d", "-s", MUX_SESSION, "-n", "menu", menu_cmd)
+        return
+    if find_window(MUX_SESSION, "menu") is None:
+        server.cmd("new-window", "-d", "-t", MUX_SESSION, "-n", "menu", menu_cmd)
+
+
+def install_menu_keybinding(session: str | None = None) -> None:
+    """Bind ``prefix + m`` to jump to the menu window (ADR-0005).
+
+    Prefix-gated so it never leaks into claude/vim typing. tmux key tables are
+    server-GLOBAL (there is no per-session key table), so a bare ``bind-key``
+    would clobber the built-in ``prefix m`` (mark-pane) for *every* session
+    sharing the operator's server — including unrelated ones. To keep the effect
+    scoped to the owned ``claude-mux`` session, the binding is guarded by an
+    ``if-shell`` on the active session name: it jumps to the menu only while the
+    key is pressed inside the owned session, and otherwise falls through to the
+    built-in ``select-pane -m`` (mark-pane) so other sessions are untouched.
+    """
+    session = session or MUX_SESSION
+    server = _server()
+    if not server.is_alive():
+        return
+    try:
+        server.cmd(
+            "bind-key", "-T", "prefix", "m",
+            "if-shell", "-F", f"#{{==:#{{session_name}},{session}}}",
+            f"select-window -t {session}:menu",
+            "select-pane -m",
+        )
+    except Exception:
+        pass
+
+
+def _attach_argv() -> list[str]:
+    """argv for ``tmux [-L sock] attach-session -t <MUX_SESSION>`` (socket-aware)."""
+    argv = ["tmux"]
+    if _SOCKET_NAME:
+        argv += ["-L", _SOCKET_NAME]
+    argv += ["attach-session", "-t", MUX_SESSION]
+    return argv
+
+
+def bootstrap(menu_cmd: str | None = None, attach: bool = True) -> None:
+    """Ensure the owned session + menu + keybinding, then place the operator in it.
+
+    Placement (ADR-0005): inside tmux -> ``switch-client`` the caller's client to
+    the owned session; outside tmux -> ``exec`` ``tmux attach-session`` so the
+    operator's real TTY is inherited (a subprocess/daemon attach fails with
+    'not a terminal'). ``attach=False`` builds the session without placing a
+    client (used by tests and headless callers). Running while already inside the
+    menu window is safe: the guard skips creation and switch-client is a no-op.
+    """
+    ensure_menu_session(menu_cmd)
+    install_menu_keybinding()
+    if not attach:
+        return
+    if in_tmux():
+        server = _server()
+        if not server.is_alive():
+            return
+        client = _current_client(server)
+        if client:
+            server.cmd("switch-client", "-c", client, "-t", MUX_SESSION)
+        else:
+            server.cmd("switch-client", "-t", MUX_SESSION)
+    else:
+        # Replace this process with the attaching tmux client so it inherits the
+        # operator's controlling terminal. Requires a real TTY.
+        os.execvp("tmux", _attach_argv())
+
+
+def _current_client(server: libtmux.Server) -> str | None:
+    """The tmux client displaying claude-mux (derived from ``$TMUX_PANE``), so
+    switch-client targets the operator's terminal, not tmux's most-recently-
+    active client. Works for both the dashboard window and a display-popup
+    (the popup's ``-E`` command inherits ``$TMUX_PANE`` of the underlying pane).
+
+    Returns None when the pane/client can't be resolved (e.g. not running inside
+    tmux) so callers can fall back to the single-client ``switch-client`` form.
+    """
+    pane = os.environ.get("TMUX_PANE")
+    if not pane:
+        return None
+    try:
+        sess = server.cmd("display-message", "-p", "-t", pane, "#{session_name}").stdout
+        session_name = sess[0] if sess else None
+        if not session_name:
+            return None
+        # Several clients can share one session (mirrored attach). The order of
+        # ``list-clients`` is not the invoking client, so ``out[0]`` may switch
+        # the wrong terminal. Prefer the most-recently-active client on the
+        # session — the one whose keypress just opened the popup — by comparing
+        # ``client_activity`` (a Unix timestamp). Falls back to first on ties.
+        out = server.cmd(
+            "list-clients", "-t", session_name,
+            "-F", "#{client_activity} #{client_name}",
+        ).stdout
+        best_name: str | None = None
+        best_activity = float("-inf")
+        for line in out:
+            if not line.strip():
+                continue
+            activity_str, _, name = line.partition(" ")
+            if not name:
+                continue
+            try:
+                activity = float(activity_str)
+            except ValueError:
+                activity = float("-inf")
+            if activity > best_activity:
+                best_activity = activity
+                best_name = name
+        return best_name
+    except Exception:
+        return None
+
+
+def jump_to(session_name: str, window_target: str | None = None, pane_id: str | None = None) -> None:
+    """Surface a window/pane within the owned session via ``select-window``.
+
+    Intra-session navigation only (ADR-0005): the attached client already lives
+    in ``claude-mux``, so ``select-window`` (+ ``select-pane``) is the full-screen
+    swap — a tmux window inherently fills the whole client. No ``switch-client``:
+    the one-time launch placement is handled by ``bootstrap``. ``session_name`` is
+    retained for signature compatibility; targets are resolved against the passed
+    (session-qualified) ``window_target`` / ``pane_id``.
     """
     server = _server()
     if not server.is_alive():
         return
-    server.cmd("switch-client", "-t", session_name)
     if window_target is not None:
         server.cmd("select-window", "-t", window_target)
     if pane_id is not None:
