@@ -18,7 +18,7 @@ from __future__ import annotations
 
 import hashlib
 
-from claude_mux import git, sessions, tmux
+from claude_mux import git, layouts, sessions, tmux
 from claude_mux.config import Config
 from claude_mux.model import Lifecycle, Project, Worktree
 
@@ -55,10 +55,18 @@ def _workspace_window_name(project_name: str, worktree: Worktree) -> str:
 
 
 def _claude_command(worktree: Worktree, config: Config, resume: bool) -> str:
-    """Build the command run in the left pane: resume the latest Session or start fresh."""
+    """Build the command run in the left pane.
+
+    ``claude_cmd`` [``--model <model>``] [``--resume <session_id>``]. The optional
+    ``--model`` pins the model regardless of any enterprise default in the on-disk
+    claude config; ``--resume`` is added when resuming the worktree's latest Session.
+    """
+    parts = [config.claude_cmd]
+    if config.model:
+        parts.append(f"--model {config.model}")
     if resume and worktree.latest_session is not None:
-        return f"{config.claude_cmd} --resume {worktree.latest_session.session_id}"
-    return config.claude_cmd
+        parts.append(f"--resume {worktree.latest_session.session_id}")
+    return " ".join(parts)
 
 
 def _open_or_select(project_name: str, worktree: Worktree, config: Config, resume: bool) -> str:
@@ -79,11 +87,25 @@ def _open_or_select(project_name: str, worktree: Worktree, config: Config, resum
         return existing
 
     claude_cmd = _claude_command(worktree, config, resume)
+    plan = layouts.build_plan(config.default_layout, claude_cmd)
     window_target = tmux.new_window(tmux.MUX_SESSION, name, worktree.path)
-    layout = tmux.build_workspace_layout(tmux.MUX_SESSION, window_target, worktree.path, claude_cmd)
+    # Build the layout and launch the sibling panes (yazi/shell), but DEFER claude:
+    # its startup terminal-capability handshake (anthropics/claude-code#17787) must
+    # not race the split/select/resize churn, or the churn's DSR replies get read as
+    # pre-typed input (the ``0n0n`` in the prompt).
+    layout = tmux.build_workspace_layout(
+        tmux.MUX_SESSION, window_target, worktree.path, plan, launch_first=False
+    )
 
     worktree.lifecycle = Lifecycle.LIVE
+    # Make the window full-screen and select the claude pane FIRST, so the pane has
+    # its final geometry and the terminal is quiet, THEN launch claude last: the
+    # respawn's ``-k`` flushes any stray replies before claude starts reading.
     tmux.jump_to(tmux.MUX_SESSION, window_target=window_target, pane_id=layout.get("claude"))
+    first = plan.panes[0]
+    tmux.launch_in_pane(
+        layout[first.role], first.command or "", settle=tmux.CLAUDE_LAUNCH_SETTLE
+    )
     return window_target
 
 

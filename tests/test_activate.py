@@ -43,12 +43,22 @@ class Recorder:
         self.log.append(("new_window", session_name, window_name, cwd))
         return f"@{window_name}"
 
-    def build_workspace_layout(self, session_name, window_target, cwd, claude_cmd):
-        self.log.append(("build_workspace_layout", session_name, window_target, cwd, claude_cmd))
+    def build_workspace_layout(self, session_name, window_target, cwd, plan, launch_first=True):
+        # ``plan`` is a layouts.LayoutPlan; record the injected claude command
+        # (the initial pane's command) so tests can assert on it as before.
+        # ``launch_first`` is recorded so tests can assert claude is DEFERRED.
+        claude_cmd = plan.panes[0].command
+        self.log.append(
+            ("build_workspace_layout", session_name, window_target, cwd, claude_cmd, launch_first)
+        )
         return {"claude": "%1", "yazi": "%2", "shell": "%3"}
 
     def jump_to(self, session_name, window_target=None, pane_id=None):
         self.log.append(("jump_to", session_name, window_target, pane_id))
+
+    def launch_in_pane(self, pane_id, command, settle=0.0):
+        # Claude is launched LAST (after jump_to), into the now-stable pane.
+        self.log.append(("launch_in_pane", pane_id, command, settle))
 
     def kill_window(self, session_name, window_target):
         self.log.append(("kill_window", session_name, window_target))
@@ -87,6 +97,7 @@ def wired(monkeypatch):
         "new_window",
         "build_workspace_layout",
         "jump_to",
+        "launch_in_pane",
         "kill_window",
     ):
         monkeypatch.setattr(activate_mod.tmux, name, getattr(rec, name))
@@ -108,24 +119,32 @@ def test_activate_fresh_when_no_window(wired):
     activate_mod.activate(wt, cfg)
 
     kinds = [c[0] for c in wired.log]
+    # Claude is launched LAST, after jump_to full-screens the window and selects the
+    # pane — so its startup handshake runs in a quiet, flushed pty (no 0n0n leak).
     assert kinds == [
         "ensure_menu_session",
         "find_window",
         "new_window",
         "build_workspace_layout",
         "jump_to",
+        "launch_in_pane",
     ]
     # Everything targets the single owned session.
     nw = next(c for c in wired.log if c[0] == "new_window")
     assert nw[1] == MUX
     layout = next(c for c in wired.log if c[0] == "build_workspace_layout")
     assert layout[4] == "claude"  # fresh, no --resume
+    assert layout[5] is False  # claude launch DEFERRED out of build_workspace_layout
     # Final jump selects the workspace window AND the claude pane, no switch-client.
     # The window target is the id captured from new_window (name-derived), whatever
     # the exact sanitized+disambiguated name is.
     name = activate_mod._workspace_window_name("proj", wt)
     jump = next(c for c in wired.log if c[0] == "jump_to")
     assert jump == ("jump_to", MUX, f"@{name}", "%1")
+    # ...and claude launches into that same pane, last, with a settle delay.
+    launch = next(c for c in wired.log if c[0] == "launch_in_pane")
+    assert launch[1] == "%1" and launch[2] == "claude"
+    assert launch[3] == tmux_mod.CLAUDE_LAUNCH_SETTLE
     assert wt.lifecycle is Lifecycle.LIVE
 
 
@@ -183,6 +202,23 @@ def test_activate_uses_custom_claude_cmd(wired):
     activate_mod.activate(wt, cfg)
     layout = next(c for c in wired.log if c[0] == "build_workspace_layout")
     assert layout[4] == "my-claude --flag"
+
+
+def test_activate_pins_model_when_configured(wired):
+    wt = _worktree()
+    cfg = Config(projects=[], claude_cmd="claude", model="opus")
+    activate_mod.activate(wt, cfg)
+    layout = next(c for c in wired.log if c[0] == "build_workspace_layout")
+    assert layout[4] == "claude --model opus"
+
+
+def test_activate_model_and_resume_compose(wired):
+    sess = SessionMeta("abc-123", "", "", 0, 1.0, "b", Path("/p"), Path("/j"))
+    wt = _worktree(latest_session=sess)
+    cfg = Config(projects=[], claude_cmd="claude", model="opus")
+    activate_mod.activate(wt, cfg)
+    layout = next(c for c in wired.log if c[0] == "build_workspace_layout")
+    assert layout[4] == "claude --model opus --resume abc-123"
 
 
 def test_window_name_is_project_slash_branch(wired):

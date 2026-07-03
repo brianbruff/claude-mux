@@ -13,12 +13,15 @@ import os
 import re
 import shlex
 import sys
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
 
 import libtmux
 from libtmux.constants import PaneDirection
+
+from claude_mux.layouts import LayoutPlan
 
 
 # The single dedicated tmux session claude-mux owns (ADR-0005). Module-level so
@@ -189,12 +192,117 @@ def new_window(session_name: str, window_name: str, cwd: Path) -> str:
     return window.window_id
 
 
-def build_workspace_layout(session_name: str, window_target: str, cwd: Path, claude_cmd: str) -> dict:
-    """Build the claude/yazi/shell split layout; return pane ids keyed by role.
+_DIRECTIONS = {"right": PaneDirection.Right, "below": PaneDirection.Below}
 
-    Layout: ``claude`` in a left vertical split (~50%), ``yazi`` top-right, a plain
-    shell bottom-right. ``claude_cmd`` is launched in the left pane and ``yazi`` in
-    the top-right pane; the bottom-right pane is left as a plain interactive shell.
+# The shell used to run pane commands, honouring $SHELL and falling back to sh.
+_SHELL = "${SHELL:-/bin/sh}"
+
+
+def launch_command_string(command: str) -> str:
+    """Wrap ``command`` for ``respawn-pane`` so it runs in an *interactive* shell.
+
+    Pure/string-only (unit-tested). We run the command as ``$SHELL -i -c '<cmd>;
+    exec $SHELL'`` rather than handing it straight to tmux because tmux would run
+    it *non-interactively* — never sourcing ``~/.zshrc`` / ``~/.bashrc``. An
+    interactive shell resolves aliases, shell functions and rc-defined PATH (e.g.
+    an nvm-installed ``claude`` or a ``george``-style alias), matching the old
+    ``send_keys``-into-the-shell behaviour. The trailing ``exec $SHELL`` leaves an
+    interactive shell in the pane after the command exits. ``$SHELL`` is expanded
+    by the interactive shell (single-quoted here), not the outer shell.
+    """
+    inner = f"{command}; exec {_SHELL}"
+    return f"exec {_SHELL} -i -c {shlex.quote(inner)}"
+
+
+def _cmd_failed(result: object) -> bool:
+    """True if a libtmux ``server.cmd`` result reports a tmux-level failure.
+
+    ``server.cmd`` does not raise on a non-zero tmux exit (only when the tmux
+    binary is missing) — it returns a result carrying ``returncode``/``stderr``.
+    So a real failure has to be read off the result, not caught as an exception.
+    """
+    if result is None:
+        return True
+    rc = getattr(result, "returncode", 0)
+    if rc not in (0, None):
+        return True
+    return bool(getattr(result, "stderr", None))
+
+
+# How long to let the terminal quiesce before respawning the claude pane. After
+# the layout's splits, sibling launches, ``select-window`` (full-screen resize)
+# and ``select-pane`` are all done, this brief settle lets any query/reply bytes
+# those operations provoked finish arriving in the pane's pty — so the following
+# ``respawn-pane -k`` can discard them before claude starts. See ``launch_in_pane``.
+CLAUDE_LAUNCH_SETTLE = 0.15
+
+
+def _launch(server: libtmux.Server, pane_id: str, command: str) -> None:
+    """Launch ``command`` in a pane by execing it, not by typing into a shell.
+
+    ``respawn-pane -k`` replaces the pane's transient shell with the wrapped
+    command (see ``launch_command_string``). The ``-k`` kill also discards
+    whatever is buffered in the pane's pty, which is load-bearing for the claude
+    pane: creating the splits and selecting/resizing the window makes tmux emit
+    terminal queries whose ``\\x1b[0n`` (device-status-report) replies land in the
+    pane. Launching claude *last* — after all that churn (see
+    ``build_workspace_layout``'s ``launch_first`` and ``launch_in_pane``) — means
+    ``-k`` flushes those stray replies right before claude starts, so they cannot
+    be read as pre-typed input (``0n0n``). Claude still runs its own startup
+    capability handshake (anthropics/claude-code#17787); that is claude-internal,
+    but it now happens in a quiet, stable, freshly-flushed pty.
+    Falls back to ``send_keys`` only if the respawn actually failed.
+    """
+    wrapped = launch_command_string(command)
+    result: object = None
+    try:
+        result = server.cmd("respawn-pane", "-k", "-t", pane_id, wrapped)
+    except Exception:
+        result = None
+    if _cmd_failed(result):
+        # Respawn failed at the tmux level (or tmux was absent): type it in. May
+        # show transient query bytes but still launches the command.
+        pane = server.panes.get(pane_id=pane_id, default=None)
+        if pane is not None:
+            try:
+                pane.send_keys(command, enter=True)
+            except Exception:
+                pass
+
+
+def launch_in_pane(pane_id: str, command: str, settle: float = 0.0) -> None:
+    """Launch ``command`` in an existing pane, optionally after a settle delay.
+
+    Public entry for launching the claude pane *after* the window is full-screen
+    and the pane has reached its final geometry (see ``build_workspace_layout``
+    with ``launch_first=False``). ``settle`` sleeps first so the terminal's replies
+    to the preceding split/select/resize churn finish arriving in the pty; the
+    ``respawn-pane -k`` inside ``_launch`` then discards them before claude runs.
+    A falsy ``command`` is a no-op (the pane stays a plain shell).
+    """
+    if not command:
+        return
+    if settle and settle > 0:
+        time.sleep(settle)
+    _launch(_server(), pane_id, command)
+
+
+def build_workspace_layout(
+    session_name: str, window_target: str, cwd: Path, plan: LayoutPlan, launch_first: bool = True
+) -> dict:
+    """Build ``plan``'s split layout in a window; return pane ids keyed by role.
+
+    ``plan`` is a ``layouts.LayoutPlan``: ``plan.panes[0]`` is the window's initial
+    pane and each later pane splits off an earlier one. Commands are launched via
+    ``_launch`` (exec, not send-keys) so no terminal-query bytes leak into a pane;
+    a pane whose spec has no command is left as a plain interactive shell. The
+    first pane (claude) is left focused.
+
+    ``launch_first=False`` builds every pane and launches every *non-first*
+    command, but leaves the first pane's command unlaunched so the caller can
+    start it last — after ``select-window``/``select-pane`` — via ``launch_in_pane``.
+    This is how the claude pane avoids reading the split/select/resize churn's
+    ``\\x1b[0n`` replies as pre-typed input (``0n0n``); see ``_launch``.
     """
     server = _server()
     window = _get_window(server, window_target)
@@ -203,41 +311,37 @@ def build_workspace_layout(session_name: str, window_target: str, cwd: Path, cla
 
     cwd_str = str(cwd)
 
-    # The window's initial pane becomes the left-hand claude pane.
-    claude_pane = window.active_pane or window.panes[0]
+    first = plan.panes[0]
+    panes = {first.role: (window.active_pane or window.panes[0])}
 
-    # Split off the right half -> top-right (yazi) at ~50% width.
-    yazi_pane = claude_pane.split(
-        direction=PaneDirection.Right,
-        start_directory=cwd_str,
-        percentage=50,
-        attach=False,
-    )
+    # Create every split first, so all panes exist before any command is launched.
+    for spec in plan.panes[1:]:
+        # Non-initial panes always name a source; default to the first pane if not.
+        source = panes[spec.frm or first.role]
+        direction = _DIRECTIONS.get(spec.direction or "right", PaneDirection.Right)
+        panes[spec.role] = source.split(
+            direction=direction,
+            start_directory=cwd_str,
+            percentage=spec.percentage if spec.percentage is not None else 50,
+            attach=False,
+        )
 
-    # Split the right pane vertically -> bottom-right (shell) at ~50% height.
-    shell_pane = yazi_pane.split(
-        direction=PaneDirection.Below,
-        start_directory=cwd_str,
-        percentage=50,
-        attach=False,
-    )
+    # Now launch the commands (execing each), leaving command-less panes as shells.
+    # When ``launch_first`` is False the first pane (claude) is skipped here so the
+    # caller can launch it last, once the window is full-screen and stable.
+    for spec in plan.panes:
+        if spec is first and not launch_first:
+            continue
+        if spec.command:
+            _launch(server, panes[spec.role].pane_id, spec.command)
 
-    # Launch commands. send_keys leaves an interactive shell if the command exits.
-    if claude_cmd:
-        claude_pane.send_keys(claude_cmd, enter=True)
-    yazi_pane.send_keys("yazi", enter=True)
-
-    # Leave the claude pane focused within this window.
+    # Leave the first (claude) pane focused within this window.
     try:
-        claude_pane.select()
+        panes[first.role].select()
     except Exception:
         pass
 
-    return {
-        "claude": claude_pane.pane_id,
-        "yazi": yazi_pane.pane_id,
-        "shell": shell_pane.pane_id,
-    }
+    return {role: pane.pane_id for role, pane in panes.items()}
 
 
 def find_window(session_name: str, window_name: str) -> str | None:

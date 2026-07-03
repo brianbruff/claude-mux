@@ -35,6 +35,8 @@ def test_save_load_round_trip_preserves_projects_and_defaults(tmp_path: Path):
         worktree_pattern="{repo}.wt/{branch}",
         base_branch="main",
         claude_cmd="claude-dev",
+        model="opus",
+        default_layout="dev",
     )
 
     save_config(config, cfg_path)
@@ -44,6 +46,19 @@ def test_save_load_round_trip_preserves_projects_and_defaults(tmp_path: Path):
     assert loaded.worktree_pattern == "{repo}.wt/{branch}"
     assert loaded.base_branch == "main"
     assert loaded.claude_cmd == "claude-dev"
+    assert loaded.model == "opus"
+    assert loaded.default_layout == "dev"
+
+
+def test_model_defaults_to_none_and_is_omitted_when_unset(tmp_path: Path):
+    # TOML has no null: an unset model must not be written, and loads back as None.
+    cfg_path = tmp_path / "config.toml"
+    save_config(Config(projects=[]), cfg_path)
+
+    assert "model" not in cfg_path.read_text()
+    loaded = load_config(cfg_path)
+    assert loaded.model is None
+    assert loaded.default_layout == "classic"
 
 
 def test_save_creates_parent_dir_and_header(tmp_path: Path):

@@ -12,6 +12,7 @@ import tempfile
 import tomllib
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Optional
 
 import tomli_w
 
@@ -30,6 +31,12 @@ class Config:
     worktree_pattern: str = "{repo}.worktrees/{branch}"
     base_branch: str = "HEAD"
     claude_cmd: str = "claude"
+    # Appended to claude_cmd as ``--model <model>`` when set. Lets an operator pin
+    # a model (e.g. "opus") without baking it into claude_cmd, and independently of
+    # any enterprise default that overrides the on-disk claude config.
+    model: Optional[str] = None
+    # Name of the Workspace layout to build on Activate (see layouts.py).
+    default_layout: str = "classic"
 
 
 def default_config_path() -> Path:
@@ -41,7 +48,8 @@ def load_config(path: Path | None = None) -> Config:
     """Load Config from TOML; missing file -> Config([]) with defaults.
 
     Project paths have ``~`` expanded. The optional ``[defaults]`` table may
-    override ``worktree_pattern``, ``base_branch`` and ``claude_cmd``.
+    override ``worktree_pattern``, ``base_branch``, ``claude_cmd``, ``model`` and
+    ``default_layout``.
     """
     cfg_path = path if path is not None else default_config_path()
 
@@ -64,6 +72,10 @@ def load_config(path: Path | None = None) -> Config:
         kwargs["base_branch"] = str(defaults["base_branch"])
     if "claude_cmd" in defaults:
         kwargs["claude_cmd"] = str(defaults["claude_cmd"])
+    if "model" in defaults:
+        kwargs["model"] = str(defaults["model"])
+    if "default_layout" in defaults:
+        kwargs["default_layout"] = str(defaults["default_layout"])
 
     return Config(projects=projects, **kwargs)  # type: ignore[arg-type]
 
@@ -78,13 +90,19 @@ def save_config(config: Config, path: Path | None = None) -> None:
     cfg_path = path if path is not None else default_config_path()
     cfg_path.parent.mkdir(parents=True, exist_ok=True)
 
+    defaults: dict[str, object] = {
+        "worktree_pattern": config.worktree_pattern,
+        "base_branch": config.base_branch,
+        "claude_cmd": config.claude_cmd,
+        "default_layout": config.default_layout,
+    }
+    # ``model`` is optional; TOML has no null, so only emit it when set.
+    if config.model is not None:
+        defaults["model"] = config.model
+
     data: dict[str, object] = {
         "projects": [str(p) for p in config.projects],
-        "defaults": {
-            "worktree_pattern": config.worktree_pattern,
-            "base_branch": config.base_branch,
-            "claude_cmd": config.claude_cmd,
-        },
+        "defaults": defaults,
     }
 
     body = tomli_w.dumps(data)
