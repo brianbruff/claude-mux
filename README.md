@@ -116,6 +116,8 @@ In the menu (Textual) tree:
 | `d`     | Remove the selected project from claude-mux (the folder is NOT deleted) |
 | `g`     | Refresh now                                                          |
 | `q`     | Quit                                                                 |
+| `j` / `k` | Move the cursor down / up (vim-style)                              |
+| `l` / `h` | Expand / collapse the selected tree node (vim-style)              |
 
 Anywhere in the `claude-mux` session (tmux binding, works inside the `claude` pane):
 
