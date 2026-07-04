@@ -114,10 +114,17 @@ In the menu (Textual) tree:
 | `x`     | Close the workspace (kills its tmux window only; git is untouched)   |
 | `a`     | Add a project (yazi folder picker, or a path prompt if yazi missing) |
 | `d`     | Remove the selected project from claude-mux (the folder is NOT deleted) |
+| `o`     | Open the selected worktree in your editor (`editor_cmd`, default `code`) |
 | `g`     | Refresh now                                                          |
 | `q`     | Quit                                                                 |
-| `j` / `k` | Move the cursor down / up (vim-style)                              |
-| `l` / `h` | Expand / collapse the selected tree node (vim-style)              |
+
+Vim-style **level** navigation (the tree has two levels — projects and their worktrees):
+
+| Key     | Action                                                               |
+| ------- | -------------------------------------------------------------------- |
+| `j` / `k` | Move to the next / previous sibling at the current level (project↔project, or worktree↔worktree of the same project) |
+| `l`     | Step **in**: on a project, into its first worktree; on a worktree, resume its session |
+| `h`     | Step **out**: from a worktree back to its project (collapses a top-level project) |
 
 Anywhere in the `claude-mux` session (tmux binding, works inside the `claude` pane):
 

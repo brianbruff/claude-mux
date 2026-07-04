@@ -10,6 +10,8 @@ the Events File mtime so a ``waiting`` transition surfaces almost immediately.
 """
 from __future__ import annotations
 
+import shlex
+import subprocess
 import threading
 from pathlib import Path
 from typing import Optional
@@ -288,15 +290,25 @@ class ClaudeMuxApp(App):
         Binding("d", "remove_project", "Remove project"),
         Binding("g", "refresh", "Refresh"),
         Binding("q", "quit", "Quit"),
-        # vim-style tree navigation. j/k mirror the arrow keys (kept off the
-        # footer to avoid clutter); l/h expand/collapse and are shown. Single
-        # letters are safe next to the modal Inputs: an Input consumes printable
-        # keys itself, so these never fire while a BranchPrompt/PathPrompt is
-        # focused (same as the existing n/r/x/a/d bindings).
+        # vim-style LEVEL navigation. The tree has two levels — Projects and
+        # their Worktrees — and hjkl move within/between them rather than over
+        # every visible row:
+        #   * j/k step to the next/previous SIBLING at the current level (project
+        #     -> project, or worktree -> worktree of the same project).
+        #   * l steps IN: on a Project, into its first Worktree; on a Worktree it
+        #     resumes that Worktree's session (same as Enter).
+        #   * h steps OUT: from a Worktree back to its Project (and collapses a
+        #     Project already at the top level).
+        #   * o opens the selected Worktree in the configured editor (VS Code).
+        # j/k are kept off the footer to avoid clutter. Single letters are safe
+        # next to the modal Inputs: an Input consumes printable keys itself, so
+        # these never fire while a BranchPrompt/PathPrompt is focused (same as
+        # the existing n/r/x/a/d bindings).
         Binding("j", "cursor_down", "Down", show=False),
         Binding("k", "cursor_up", "Up", show=False),
-        Binding("l", "expand_node", "Expand / in"),
-        Binding("h", "collapse_node", "Collapse / out"),
+        Binding("l", "step_in", "In / resume"),
+        Binding("h", "step_out", "Out"),
+        Binding("o", "open_editor", "Open in editor"),
     ]
 
     def __init__(self, config: Config, popup: bool = False):
@@ -489,42 +501,112 @@ class ClaudeMuxApp(App):
         if isinstance(data, Worktree):
             self._jump_or_activate(data)
 
-    # -- vim tree navigation ------------------------------------------------ #
+    # -- vim LEVEL navigation ----------------------------------------------- #
+
+    @staticmethod
+    def _sibling_index(node) -> Optional[tuple[list, int]]:
+        """Return ``(siblings, index)`` for ``node`` among its parent's children.
+
+        None when the node has no parent (the root) or is somehow not found in
+        its parent — callers treat that as 'nowhere to step'.
+        """
+        parent = node.parent
+        if parent is None:
+            return None
+        siblings = list(parent.children)
+        for i, sib in enumerate(siblings):
+            if sib is node:
+                return siblings, i
+        return None
 
     def action_cursor_down(self) -> None:
-        if self._tree is not None:
-            self._tree.action_cursor_down()
+        """``j``: move to the next sibling at the current level.
+
+        Next Project on a Project row, next Worktree (of the same Project) on a
+        Worktree row. From the container root it steps onto the first Project so
+        the tree is reachable on the very first keypress.
+        """
+        tree = self._tree
+        if tree is None:
+            return
+        node = tree.cursor_node
+        if node is None:
+            return
+        if node is tree.root:
+            children = list(node.children)
+            if children:
+                tree.move_cursor(children[0])
+            return
+        info = self._sibling_index(node)
+        if info is None:
+            return
+        siblings, idx = info
+        if idx + 1 < len(siblings):
+            tree.move_cursor(siblings[idx + 1])
 
     def action_cursor_up(self) -> None:
-        if self._tree is not None:
-            self._tree.action_cursor_up()
+        """``k``: move to the previous sibling at the current level."""
+        tree = self._tree
+        if tree is None:
+            return
+        node = tree.cursor_node
+        if node is None or node is tree.root:
+            return
+        info = self._sibling_index(node)
+        if info is None:
+            return
+        siblings, idx = info
+        if idx - 1 >= 0:
+            tree.move_cursor(siblings[idx - 1])
 
-    def action_expand_node(self) -> None:
-        """``l``: expand a collapsed node, else step into its first child."""
+    def action_step_in(self) -> None:
+        """``l``: step IN a level.
+
+        On a Project: expand it if needed and move onto its first Worktree. On a
+        Worktree: resume that Worktree's session (same as Enter). From the root:
+        drop onto the first Project.
+        """
         tree = self._tree
         if tree is None:
             return
         node = tree.cursor_node
         if node is None:
             return
+        if isinstance(node.data, Worktree):
+            self._jump_or_activate(node.data)
+            return
+        # Project row (or the container root): descend to the first child.
         if node.allow_expand and not node.is_expanded:
             node.expand()
-        else:
-            # Already expanded (or a leaf): step in / down to the next row.
-            tree.action_cursor_down()
+        children = list(node.children)
+        if children:
+            tree.move_cursor(children[0])
 
-    def action_collapse_node(self) -> None:
-        """``h``: collapse an expanded node, else step out to its parent."""
+    def action_step_out(self) -> None:
+        """``h``: step OUT a level.
+
+        From a Worktree back to its parent Project; on a top-level Project (whose
+        parent is the container root) collapse it for a tidy view.
+        """
         tree = self._tree
         if tree is None:
             return
         node = tree.cursor_node
         if node is None:
             return
-        if node.allow_expand and node.is_expanded:
+        parent = node.parent
+        if parent is not None and parent is not tree.root:
+            tree.move_cursor(parent)
+        elif node.allow_expand and node.is_expanded:
             node.collapse()
-        elif node.parent is not None and node.parent is not tree.root:
-            tree.move_cursor(node.parent)
+
+    def action_open_editor(self) -> None:
+        """``o``: open the selected Worktree in the configured editor."""
+        wt = self._current_worktree()
+        if wt is None:
+            self.notify("Select a worktree to open in the editor", severity="warning")
+            return
+        self._do_open_editor(wt)
 
     def action_jump(self) -> None:
         self._jump_or_activate(self._current_worktree())
@@ -722,6 +804,27 @@ class ClaudeMuxApp(App):
             self.call_from_thread(self.notify, f"close failed: {exc}", severity="error")
             return
         self.call_from_thread(self._trigger_refresh)
+
+    @work(thread=True, group="editor")
+    def _do_open_editor(self, wt: Worktree) -> None:
+        # Off the UI thread: spawn the editor detached (Popen, not run) so a
+        # slow-launching GUI never blocks the event loop. ``editor_cmd`` is split
+        # with shlex and the worktree path appended — ``code /path/to/wt``. A
+        # missing binary (editor not installed / not on PATH) is surfaced as a
+        # notification rather than crashing the TUI.
+        cmd = shlex.split(self.config.editor_cmd) + [str(wt.path)]
+        try:
+            subprocess.Popen(
+                cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+            )
+        except Exception as exc:
+            self.call_from_thread(
+                self.notify, f"open in editor failed: {exc}", severity="error"
+            )
+            return
+        self.call_from_thread(
+            self.notify, f"Opening {wt.branch or wt.path.name} in editor"
+        )
 
     def _after_navigation(self) -> None:
         """After a jump/activate: close the popup, else refresh the dashboard."""
