@@ -428,11 +428,20 @@ class ClaudeMuxApp(App):
             elif isinstance(node.data, Project):
                 selected_project = node.data.root
 
+        # Preserve each project's expand/collapse state across the rebuild, so a
+        # background refresh never re-expands a project the operator collapsed.
+        # Projects not seen before (absent from the map) default to expanded.
+        collapsed_projects: set[Path] = set()
+        for child in tree.root.children:
+            if isinstance(child.data, Project) and not child.is_expanded:
+                collapsed_projects.add(child.data.root)
+
         tree.clear()
         tree.root.expand()
         restore = None
         for project in projects:
-            pnode = tree.root.add(project_label(project), data=project, expand=True)
+            expand = project.root not in collapsed_projects
+            pnode = tree.root.add(project_label(project), data=project, expand=expand)
             if selected_project is not None and project.root == selected_project:
                 restore = pnode
             for wt in project.worktrees:

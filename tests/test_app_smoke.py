@@ -94,3 +94,38 @@ def test_cursor_survives_auto_refresh() -> None:
             assert after.path == before.path, "cursor jumped to a different row"
 
     _run(scenario())
+
+
+def test_collapse_survives_auto_refresh() -> None:
+    """Regression: collapsing a project must not be undone by the ~4s
+    auto-refresh rebuilding the tree. A background rebuild re-expanding a
+    collapsed project is the 'they expand automatically after a second' bug."""
+    from pathlib import Path
+
+    from claude_mux.model import Lifecycle, Project, Worktree
+
+    def make_projects() -> list[Project]:
+        wts = [
+            Worktree(project_name="p", path=Path("/p/wt0"),
+                     branch="branch0", lifecycle=Lifecycle.DORMANT)
+        ]
+        return [Project(name="p", root=Path("/p"), session_name="p", worktrees=wts)]
+
+    async def scenario() -> None:
+        app = ClaudeMuxApp(Config(projects=[]))
+        app.engine.snapshot = make_projects  # stable nodes across refreshes
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            pnode = app._tree.root.children[0]
+            assert pnode.is_expanded
+            pnode.collapse()
+            await pilot.pause()
+            assert not pnode.is_expanded
+
+            app._rebuild_tree(make_projects())  # simulate auto-refresh
+            await pilot.pause()
+
+            pnode_after = app._tree.root.children[0]
+            assert not pnode_after.is_expanded, "collapsed project re-expanded on refresh"
+
+    _run(scenario())
