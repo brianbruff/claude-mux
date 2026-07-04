@@ -104,6 +104,25 @@ def test_bootstrap_creates_menu_window(mux):
     assert _window_names(sock, session).count("menu") == 1
 
 
+def _pane_count(sock: str, window_target: str) -> int:
+    out = _q(sock, "list-panes", "-t", window_target, "-F", "#{pane_id}")
+    return len([p for p in out.splitlines() if p])
+
+
+def test_bootstrap_adds_terminal_beside_menu(mux):
+    sock, session = mux
+    tmux.bootstrap(menu_cmd=INERT, attach=False)
+
+    # The menu window carries two panes: the Textual tree (left) + a shell (right).
+    assert _pane_count(sock, f"{session}:menu") == 2
+    # The left pane (the tree) stays focused so the operator drives the menu.
+    assert _q(sock, "display-message", "-p", "-t", session, "#{pane_left}") == "0"
+    # Idempotent: re-running bootstrap does not stack up extra terminals.
+    tmux.bootstrap(menu_cmd=INERT, attach=False)
+    tmux.ensure_menu_terminal()
+    assert _pane_count(sock, f"{session}:menu") == 2
+
+
 def test_open_or_select_creates_and_selects_workspace(mux):
     sock, session = mux
     tmux.bootstrap(menu_cmd=INERT, attach=False)

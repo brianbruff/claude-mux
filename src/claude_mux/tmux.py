@@ -1,8 +1,9 @@
 """tmux interaction via libtmux (pane listing, capture, layout, navigation).
 
 claude-mux owns ONE dedicated tmux session, ``claude-mux`` (see ADR-0005). Its
-window 0 is the ``menu`` (the Textual Project→Worktree tree); each entered
-Worktree is a full-screen window in that same session carrying the three-pane
+window 0 is the ``menu``: the Textual Project→Worktree tree on the left with a
+plain shell (rooted at the launch directory, ``./``) split off to its right. Each
+entered Worktree is a full-screen window in that same session carrying the three-pane
 Workspace layout: ``claude`` in a left vertical split (~50%), ``yazi`` top-right,
 and a plain shell bottom-right. Navigation is ``select-window`` within the owned
 session — there is no ``switch-client`` to external/per-project sessions.
@@ -378,7 +379,12 @@ def _menu_command() -> str:
     return f"{shlex.quote(sys.executable)} -m claude_mux _menu"
 
 
-def ensure_menu_session(menu_cmd: str | None = None) -> None:
+# Width (percent of the menu window) given to the terminal that sits to the
+# right of the Textual tree. The tree keeps the majority so its rows stay legible.
+MENU_TERMINAL_PERCENT = 40
+
+
+def ensure_menu_session(menu_cmd: str | None = None, terminal_cwd: Path | None = None) -> None:
     """Ensure the owned session exists with a ``menu`` window (idempotent).
 
     Guard from the ADR contract: create the session when absent; if it exists but
@@ -386,15 +392,58 @@ def ensure_menu_session(menu_cmd: str | None = None) -> None:
     client — placement is ``bootstrap``'s job. ``menu_cmd`` runs AS the menu
     window's process (if it exits the window closes), so callers pass a foreground
     command; defaults to the in-place Textual menu.
+
+    The menu window carries two panes: the Textual tree on the left and a plain
+    interactive shell on the right (rooted at ``terminal_cwd`` — the directory
+    ``claude-mux`` was launched from, i.e. ``./``). ``ensure_menu_terminal`` adds
+    that shell idempotently, so this stays safe to call on every workspace open.
     """
     if menu_cmd is None:
         menu_cmd = _menu_command()
     server = _server()
     if not (server.is_alive() and server.has_session(MUX_SESSION)):
         server.cmd("new-session", "-d", "-s", MUX_SESSION, "-n", "menu", menu_cmd)
+        ensure_menu_terminal(terminal_cwd)
         return
     if find_window(MUX_SESSION, "menu") is None:
         server.cmd("new-window", "-d", "-t", MUX_SESSION, "-n", "menu", menu_cmd)
+    ensure_menu_terminal(terminal_cwd)
+
+
+def ensure_menu_terminal(cwd: Path | None = None, percentage: int = MENU_TERMINAL_PERCENT) -> None:
+    """Split the menu window so a plain shell sits to the right of the tree.
+
+    Idempotent: only splits while the menu window still has its single (Textual)
+    pane, so repeated calls — ``ensure_menu_session`` runs on every workspace
+    open — never stack up extra terminals. The new right-hand pane is left as a
+    plain interactive shell (no command) rooted at ``cwd`` (defaults to the
+    launch directory, ``./``). Focus is returned to the tree pane so the operator
+    still drives the menu by default; the terminal is one ``select-pane`` away.
+    """
+    server = _server()
+    if not server.is_alive():
+        return
+    window_id = find_window(MUX_SESSION, "menu")
+    if window_id is None:
+        return
+    window = _get_window(server, window_id)
+    if window is None or len(window.panes) > 1:
+        return  # no menu window, or the terminal is already present
+    menu_pane = window.active_pane or window.panes[0]
+    try:
+        menu_pane.split(
+            direction=PaneDirection.Right,
+            start_directory=str(cwd or Path.cwd()),
+            percentage=percentage,
+            attach=False,
+        )
+    except Exception:
+        return
+    # Keep the Textual tree focused; the operator opts into the terminal explicitly.
+    try:
+        menu_pane.select()
+    except Exception:
+        pass
 
 
 def install_menu_keybinding(session: str | None = None) -> None:

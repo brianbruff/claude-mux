@@ -55,7 +55,7 @@ The action that takes a **Dormant** Worktree to **Live** (confirmed): build its 
 claude-mux owns a **single dedicated tmux session** (`claude-mux`). Its **window 0 is the Menu**; each **Workspace** (Worktree) is a full-screen **window** in that same session. Navigation is `select-window` within the owned session (not a session-per-Project), and a session-scoped tmux binding returns to the Menu. The Project → Worktree grouping lives only in the **Menu** tree, not in tmux structure. Nothing outside claude-mux is touched. (Confirmed. Supersedes ADR-0002. See ADR-0005.)
 
 **Menu**:
-Window 0 of the `claude-mux` session — the Textual **Project → Worktree** tree from which the operator picks a Worktree to enter. Always survives; one tmux keystroke away from any **Workspace**.
+Window 0 of the `claude-mux` session — the Textual **Project → Worktree** tree from which the operator picks a Worktree to enter, with a plain shell (rooted at the launch directory, `./`) split off to its right for ad-hoc commands without leaving the menu. Always survives; one tmux keystroke away from any **Workspace**.
 
 ## Flagged ambiguities
 
