@@ -7,14 +7,32 @@ deletes, or modifies any project directory or git data.
 from __future__ import annotations
 
 import os
+import shutil
 import subprocess
 import tempfile
 import tomllib
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
 
 import tomli_w
+
+# Candidate GUI editor CLIs, in preference order, used to pick a sensible
+# default when the operator has not set ``editor_cmd``. The first one resolvable
+# on PATH wins. ``$EDITOR``/``$VISUAL`` are deliberately NOT consulted: the ``o``
+# binding spawns the editor detached with stdout/stderr to /dev/null, so a
+# terminal editor (nvim, vim) would launch invisibly and uselessly. Note a shell
+# alias (e.g. ``code`` -> ``code-insiders``) is NOT a PATH binary, so
+# ``shutil.which`` correctly skips it -- avoiding the Errno 2 spawn failure.
+_EDITOR_CANDIDATES = ("code", "code-insiders", "cursor", "subl", "zed")
+
+
+def _detect_editor() -> str:
+    """Return the first resolvable GUI editor CLI, falling back to ``code``."""
+    for candidate in _EDITOR_CANDIDATES:
+        if shutil.which(candidate):
+            return candidate
+    return "code"
 
 _CONFIG_HEADER = (
     "# claude-mux configuration\n"
@@ -39,8 +57,10 @@ class Config:
     default_layout: str = "classic"
     # Command used to open a Worktree in an external editor (the ``o`` binding).
     # Split with shlex and the worktree path is appended, so ``code`` opens VS
-    # Code; override to e.g. ``code -r`` or another editor's CLI.
-    editor_cmd: str = "code"
+    # Code; override to e.g. ``code -r`` or another editor's CLI. Defaults to the
+    # first GUI editor CLI found on PATH (see ``_detect_editor``) so a bare-alias
+    # ``code`` that isn't a real binary doesn't cause an Errno 2 spawn failure.
+    editor_cmd: str = field(default_factory=_detect_editor)
 
 
 def default_config_path() -> Path:
