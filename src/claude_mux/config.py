@@ -37,6 +37,10 @@ class Config:
     model: Optional[str] = None
     # Name of the Workspace layout to build on Activate (see layouts.py).
     default_layout: str = "classic"
+    # Command used to open a Worktree in an external editor (the ``o`` binding).
+    # Split with shlex and the worktree path is appended, so ``code`` opens VS
+    # Code; override to e.g. ``code -r`` or another editor's CLI.
+    editor_cmd: str = "code"
 
 
 def default_config_path() -> Path:
@@ -76,6 +80,8 @@ def load_config(path: Path | None = None) -> Config:
         kwargs["model"] = str(defaults["model"])
     if "default_layout" in defaults:
         kwargs["default_layout"] = str(defaults["default_layout"])
+    if "editor_cmd" in defaults:
+        kwargs["editor_cmd"] = str(defaults["editor_cmd"])
 
     return Config(projects=projects, **kwargs)  # type: ignore[arg-type]
 
@@ -95,6 +101,7 @@ def save_config(config: Config, path: Path | None = None) -> None:
         "base_branch": config.base_branch,
         "claude_cmd": config.claude_cmd,
         "default_layout": config.default_layout,
+        "editor_cmd": config.editor_cmd,
     }
     # ``model`` is optional; TOML has no null, so only emit it when set.
     if config.model is not None:
