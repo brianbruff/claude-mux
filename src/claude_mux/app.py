@@ -23,7 +23,7 @@ from textual.containers import Horizontal, Vertical
 from textual.screen import ModalScreen
 from textual.widgets import Button, Footer, Header, Input, Label, Static, Tree
 
-from claude_mux import activate, panemap, picker
+from claude_mux import activate, panemap, picker, treestate
 from claude_mux.config import Config, add_project, load_config, remove_project
 from claude_mux.model import Activity, Lifecycle, LiveClaude, Project, Worktree
 from claude_mux.status import StatusEngine
@@ -319,6 +319,12 @@ class ClaudeMuxApp(App):
         self.engine = StatusEngine(config)
         self._projects: list[Project] = []
         self._events_mtime: float = 0.0
+        # Authoritative set of collapsed Project roots, seeded from disk so the
+        # operator's expand/collapse layout survives across sessions. Kept in
+        # sync by the NodeCollapsed/NodeExpanded handlers (which fire for every
+        # toggle path: Enter, h/l, mouse) and consumed by _rebuild_tree so a
+        # background refresh never re-expands a collapsed Project.
+        self._collapsed_projects: set[Path] = treestate.load_collapsed()
         # Monotonic generation bumped whenever the engine is swapped (config
         # add/remove). A refresh worker captures the generation current when it
         # starts; _rebuild_tree drops any result whose generation is stale, so a
@@ -430,17 +436,14 @@ class ClaudeMuxApp(App):
 
         # Preserve each project's expand/collapse state across the rebuild, so a
         # background refresh never re-expands a project the operator collapsed.
-        # Projects not seen before (absent from the map) default to expanded.
-        collapsed_projects: set[Path] = set()
-        for child in tree.root.children:
-            if isinstance(child.data, Project) and not child.is_expanded:
-                collapsed_projects.add(child.data.root)
-
+        # The authoritative source is self._collapsed_projects (persisted to
+        # disk and kept current by the collapse/expand handlers); a Project
+        # absent from it defaults to expanded.
         tree.clear()
         tree.root.expand()
         restore = None
         for project in projects:
-            expand = project.root not in collapsed_projects
+            expand = project.root not in self._collapsed_projects
             pnode = tree.root.add(project_label(project), data=project, expand=expand)
             if selected_project is not None and project.root == selected_project:
                 restore = pnode
@@ -509,6 +512,38 @@ class ClaudeMuxApp(App):
         data = event.node.data
         if isinstance(data, Worktree):
             self._jump_or_activate(data)
+
+    def on_tree_node_collapsed(self, event: Tree.NodeCollapsed) -> None:
+        self._record_collapse(event.node, collapsed=True)
+
+    def on_tree_node_expanded(self, event: Tree.NodeExpanded) -> None:
+        self._record_collapse(event.node, collapsed=False)
+
+    def _record_collapse(self, node, collapsed: bool) -> None:
+        """Track a Project's collapse toggle and persist only real changes.
+
+        Fires for every collapse path (Enter, h/l, mouse). Non-Project nodes
+        (the root, Worktree leaves) are ignored. Persisting only when the set
+        actually changes means the events emitted while _rebuild_tree re-adds
+        nodes at their already-known state cause no write, so the 4s refresh
+        never touches disk — only a genuine operator toggle does.
+        """
+        data = node.data
+        if not isinstance(data, Project):
+            return
+        root = data.root
+        was_collapsed = root in self._collapsed_projects
+        if collapsed:
+            self._collapsed_projects.add(root)
+        else:
+            self._collapsed_projects.discard(root)
+        if (root in self._collapsed_projects) == was_collapsed:
+            return  # no state change -> nothing to persist
+        try:
+            treestate.save_collapsed(self._collapsed_projects)
+        except OSError as exc:
+            # View state is disposable; a failed write must not disrupt the UI.
+            self.notify(f"could not save tree state: {exc}", severity="warning")
 
     # -- vim LEVEL navigation ----------------------------------------------- #
 

@@ -54,6 +54,9 @@ The action that takes a **Dormant** Worktree to **Live** (confirmed): build its 
 **tmux mapping**:
 claude-mux owns a **single dedicated tmux session** (`claude-mux`). Its **window 0 is the Menu**; each **Workspace** (Worktree) is a full-screen **window** in that same session. Navigation is `select-window` within the owned session (not a session-per-Project), and a session-scoped tmux binding returns to the Menu. The Project → Worktree grouping lives only in the **Menu** tree, not in tmux structure. Nothing outside claude-mux is touched. (Confirmed. Supersedes ADR-0002. See ADR-0005.)
 
+**Tree State**:
+The persisted view state of the **Menu** tree — currently the set of collapsed **Project** roots — stored as `~/.config/claude-mux/tree-state.json` (override the dir with `CLAUDE_MUX_STATE_DIR`). Kept separate from the **Config** on purpose: the Config is the hand-editable list of Projects, whereas Tree State is disposable layout state claude-mux owns outright and rewrites freely. A missing or corrupt file loads as "everything expanded" — it never blocks the Menu from opening. Keyed by absolute Project path; a removed Project's stale key is ignored on load.
+
 **Menu**:
 Window 0 of the `claude-mux` session — the Textual **Project → Worktree** tree from which the operator picks a Worktree to enter, with a plain shell (rooted at the launch directory, `./`) split off to its right for ad-hoc commands without leaving the menu. Always survives; one tmux keystroke away from any **Workspace**.
 
