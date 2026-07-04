@@ -129,3 +129,73 @@ def test_collapse_survives_auto_refresh() -> None:
             assert not pnode_after.is_expanded, "collapsed project re-expanded on refresh"
 
     _run(scenario())
+
+
+def test_collapse_persists_across_app_restart() -> None:
+    """Collapsing a project is written to disk and restored in a fresh app
+    instance, so the operator's expand/collapse layout survives across
+    sessions (backed by treestate)."""
+    from pathlib import Path
+
+    from claude_mux.model import Lifecycle, Project, Worktree
+
+    def make_projects() -> list[Project]:
+        wts = [
+            Worktree(project_name="p", path=Path("/p/wt0"),
+                     branch="branch0", lifecycle=Lifecycle.DORMANT)
+        ]
+        return [Project(name="p", root=Path("/p"), session_name="p", worktrees=wts)]
+
+    async def first_session() -> None:
+        app = ClaudeMuxApp(Config(projects=[]))
+        app.engine.snapshot = make_projects
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            pnode = app._tree.root.children[0]
+            assert pnode.is_expanded
+            pnode.collapse()
+            await pilot.pause()  # let the collapse event persist
+
+    async def second_session() -> None:
+        # A brand-new app instance reads the persisted state on construction.
+        app = ClaudeMuxApp(Config(projects=[]))
+        app.engine.snapshot = make_projects
+        assert Path("/p") in app._collapsed_projects
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            pnode = app._tree.root.children[0]
+            assert not pnode.is_expanded, "project not restored collapsed after restart"
+
+    _run(first_session())
+    _run(second_session())
+
+
+def test_expand_clears_persisted_collapse() -> None:
+    """Re-expanding a previously-collapsed project removes it from the persisted
+    set, so the layout is restored expanded next time (not stuck collapsed)."""
+    from pathlib import Path
+
+    from claude_mux import treestate
+    from claude_mux.model import Lifecycle, Project, Worktree
+
+    def make_projects() -> list[Project]:
+        wts = [
+            Worktree(project_name="p", path=Path("/p/wt0"),
+                     branch="branch0", lifecycle=Lifecycle.DORMANT)
+        ]
+        return [Project(name="p", root=Path("/p"), session_name="p", worktrees=wts)]
+
+    async def scenario() -> None:
+        app = ClaudeMuxApp(Config(projects=[]))
+        app.engine.snapshot = make_projects
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            pnode = app._tree.root.children[0]
+            pnode.collapse()
+            await pilot.pause()
+            assert Path("/p") in treestate.load_collapsed()
+            pnode.expand()
+            await pilot.pause()
+            assert Path("/p") not in treestate.load_collapsed()
+
+    _run(scenario())
