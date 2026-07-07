@@ -11,19 +11,23 @@ the Events File mtime so a ``waiting`` transition surfaces almost immediately.
 from __future__ import annotations
 
 import shlex
+import socket
 import subprocess
 import threading
+from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
+from rich.text import Text
 from textual import work
 from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.containers import Horizontal, Vertical
 from textual.screen import ModalScreen
-from textual.widgets import Button, Footer, Header, Input, Label, Static, Tree
+from textual.theme import Theme
+from textual.widgets import Button, Footer, Header, Input, Label, Select, Static, Tree
 
-from claude_mux import activate, panemap, picker, treestate
+from claude_mux import activate, git, panemap, picker, treestate
 from claude_mux.config import Config, add_project, load_config, remove_project
 from claude_mux.model import Activity, Lifecycle, LiveClaude, Project, Worktree
 from claude_mux.status import StatusEngine
@@ -133,12 +137,139 @@ def project_label(project: Project) -> str:
 
 
 # --------------------------------------------------------------------------- #
+# Display palette + Rich label rendering (claude-mux TUI.dc.html)              #
+# --------------------------------------------------------------------------- #
+# One authority accent — Enverus green — carries running state, active selection
+# and the primary CTA; amber is caution, blue is info/idle, red is failure.
+# Hairlines and surface contrast do the separation work, not a loud green bar.
+# The pure ``*_label`` helpers above stay plain text (unit tested); the
+# ``*_rich_label`` builders below add colour for on-screen rendering only.
+
+_GREEN = "#6cbf3f"        # running / live / primary accent
+_AMBER = "#d9a441"        # caution / waiting / uncommitted
+_BLUE = "#3d9bd4"         # info / idle / open workspace
+_RED = "#d16565"          # failure
+_TEXT_BRIGHT = "#eef2f4"  # active-row branch name
+_TEXT = "#c7cdd3"         # body text
+_MUTED = "#9aa1a8"        # summaries, secondary metadata
+_DIM = "#7f868d"          # tertiary
+_FAINT = "#5f666c"        # dormant markers, primary flag
+_SEP = "#4a5157"          # metadata dot separators
+
+
+# Enverus-green dark theme. Registered on the App so it drives every stock
+# widget at once — Header, Footer, the modals' ``$accent`` borders, the command
+# palette (1e) and the keys/help panel (1f) all inherit these tokens.
+CLAUDE_MUX_THEME = Theme(
+    name="claude-mux",
+    primary="#3C8321",     # authority green: running / selected / primary CTA
+    secondary=_BLUE,       # info / idle
+    accent=_GREEN,         # bright green highlights + focus rings
+    success=_GREEN,
+    warning=_AMBER,
+    error=_RED,
+    foreground=_TEXT,
+    background="#101214",
+    surface="#17191b",
+    panel="#1b1d1f",
+    dark=True,
+    variables={
+        "footer-key-foreground": _GREEN,
+        "footer-description-foreground": "#8b9298",
+        "block-cursor-foreground": "#ffffff",
+        "block-cursor-background": "#3C8321",
+        "input-selection-background": "#3C8321 45%",
+    },
+)
+
+
+def _marker_color(wt: Worktree) -> str:
+    """Colour for a worktree's lifecycle marker, folding in live activity.
+
+    Running is green (authority), waiting is amber (needs the operator), idle is
+    blue, an open-but-quiet workspace is blue, and a dormant worktree is faint.
+    """
+    if wt.lifecycle is Lifecycle.LIVE:
+        activity = wt.live.activity if wt.live else Activity.UNKNOWN
+        if activity is Activity.WAITING:
+            return _AMBER
+        if activity is Activity.IDLE:
+            return _BLUE
+        return _GREEN
+    if wt.lifecycle is Lifecycle.OPEN:
+        return _BLUE
+    return _FAINT
+
+
+def worktree_rich_label(wt: Worktree) -> Text:
+    """Coloured Rich label for a Worktree row (display mirror of ``worktree_label``).
+
+    A running worktree gets a bold bright name and a green ``RUNNING`` tag; every
+    other state stays quiet so the one running row is the thing the eye lands on.
+    Built as a ``Text`` (not a markup string) so branch names / summaries with
+    ``[`` never need escaping.
+    """
+    marker = _LIFECYCLE_MARKER.get(wt.lifecycle, "?")
+    live = wt.live
+    running = (
+        wt.lifecycle is Lifecycle.LIVE
+        and live is not None
+        and live.activity is Activity.RUNNING
+    )
+
+    label = Text(no_wrap=True)
+    label.append(f"{marker} ", style=_marker_color(wt))
+    name = wt.branch or wt.path.name
+    label.append(name, style=f"bold {_TEXT_BRIGHT}" if running else _TEXT)
+    if wt.is_primary:
+        label.append(" *", style=_FAINT)
+
+    if running:
+        label.append("  RUNNING", style=f"bold {_GREEN}")
+    else:
+        activity = activity_text(live)
+        if activity:
+            waiting = live is not None and live.activity is Activity.WAITING
+            label.append(f"  {activity}", style=_AMBER if waiting else _MUTED)
+
+    summary = worktree_summary(wt)
+    if summary:
+        label.append(f"  {summary}", style=_MUTED)
+
+    extras = scrape_extras(live)
+    if extras:
+        label.append("  ")
+        for i, extra in enumerate(extras):
+            if i:
+                label.append(" · ", style=_SEP)
+            label.append(extra, style="#dfe4e8" if running else _MUTED)
+
+    return label
+
+
+def project_rich_label(project: Project) -> Text:
+    """Coloured Rich label for a Project node (name + worktree count)."""
+    count = len(project.worktrees)
+    suffix = "worktree" if count == 1 else "worktrees"
+    label = Text(no_wrap=True)
+    label.append(project.name, style=f"bold {_MUTED}")
+    label.append(f"  · {count} {suffix}", style=_FAINT)
+    return label
+
+
+# --------------------------------------------------------------------------- #
 # Modal dialogs                                                                #
 # --------------------------------------------------------------------------- #
 
 
-class BranchPromptScreen(ModalScreen[Optional[str]]):
-    """Prompt for a new worktree branch name; dismisses with the name or None."""
+class BranchPromptScreen(ModalScreen[Optional[tuple[str, str]]]):
+    """Prompt for a new worktree branch name and its base branch.
+
+    Dismisses with ``(branch, base)`` on submit, or ``None`` on cancel. ``base`` is
+    the commit-ish the new branch is created off — preselected to the git-flow-aware
+    default (develop > main > master > configured fallback) and changeable via the
+    dropdown for the exceptions (e.g. a hotfix off ``main``).
+    """
 
     DEFAULT_CSS = """
     BranchPromptScreen {
@@ -154,20 +285,51 @@ class BranchPromptScreen(ModalScreen[Optional[str]]):
     BranchPromptScreen Label {
         margin-bottom: 1;
     }
+    BranchPromptScreen #base-label {
+        margin-top: 1;
+    }
     """
 
     BINDINGS = [Binding("escape", "cancel", "Cancel")]
+
+    def __init__(self, branches: list[str], default_base: str) -> None:
+        """``branches`` are the selectable bases; ``default_base`` is preselected.
+
+        ``default_base`` is guaranteed to be offered even if it is not in
+        ``branches`` (e.g. the ``HEAD`` fallback for a repo with no branches yet).
+        """
+        super().__init__()
+        options = list(branches)
+        if default_base not in options:
+            options.insert(0, default_base)
+        self._options = options
+        self._default_base = default_base
 
     def compose(self) -> ComposeResult:
         with Vertical(id="dialog"):
             yield Label("New worktree branch name:")
             yield Input(placeholder="feature/my-branch", id="branch")
+            yield Label("Base branch:", id="base-label")
+            yield Select(
+                [(name, name) for name in self._options],
+                value=self._default_base,
+                allow_blank=False,
+                id="base",
+            )
 
     def on_mount(self) -> None:
         self.query_one(Input).focus()
 
     def on_input_submitted(self, event: Input.Submitted) -> None:
-        self.dismiss(event.value.strip() or None)
+        self._submit()
+
+    def _submit(self) -> None:
+        branch = self.query_one("#branch", Input).value.strip()
+        if not branch:
+            self.dismiss(None)
+            return
+        base = self.query_one("#base", Select).value
+        self.dismiss((branch, base))
 
     def action_cancel(self) -> None:
         self.dismiss(None)
@@ -276,8 +438,71 @@ class ClaudeMuxApp(App):
     TITLE = "claude-mux"
 
     CSS = """
+    Screen {
+        background: $background;
+    }
+
+    Header {
+        background: $panel;
+        color: $foreground;
+    }
+
+    /* The Project -> Worktree tree: quiet surface, hairline guides, and a
+       green-tinted active row (the design's left-accent selection). */
     Tree {
         padding: 0 1;
+        background: $surface;
+        color: $foreground;
+        scrollbar-background: $surface;
+        scrollbar-color: #2a2e31;
+    }
+    Tree > .tree--cursor {
+        background: $primary 20%;
+        color: $text;
+        text-style: bold;
+    }
+    Tree > .tree--highlight-line {
+        background: $primary 8%;
+    }
+    Tree > .tree--guides {
+        color: #2a2e31;
+    }
+    Tree > .tree--guides-selected {
+        color: $accent;
+    }
+    Tree > .tree--guides-hover {
+        color: $primary;
+    }
+
+    /* Quiet, informative status line — replaces the loud full-width green bar. */
+    #statusline {
+        height: 1;
+        padding: 0 1;
+        background: $panel;
+        color: $foreground;
+    }
+
+    /* Footer: muted descriptions with green key-caps (the one accent). */
+    Footer {
+        background: $surface;
+        color: $foreground;
+    }
+    FooterKey {
+        background: $surface;
+    }
+    FooterKey > .footer-key--key {
+        color: $accent;
+        background: $surface;
+        text-style: bold;
+    }
+    FooterKey > .footer-key--description {
+        color: #8b9298;
+        background: $surface;
+    }
+
+    /* Green focus ring on the active input, per the modal spec (1d). */
+    Input:focus {
+        border: tall $accent;
     }
     """
 
@@ -319,6 +544,8 @@ class ClaudeMuxApp(App):
         self.engine = StatusEngine(config)
         self._projects: list[Project] = []
         self._events_mtime: float = 0.0
+        # Short hostname for the status line (drop any domain suffix).
+        self._host = socket.gethostname().split(".")[0]
         # Authoritative set of collapsed Project roots, seeded from disk so the
         # operator's expand/collapse layout survives across sessions. Kept in
         # sync by the NodeCollapsed/NodeExpanded handlers (which fire for every
@@ -357,15 +584,22 @@ class ClaudeMuxApp(App):
     def compose(self) -> ComposeResult:
         yield Header()
         yield Tree("Projects", id="tree")
-        # Menu footer hint: the back-to-menu tmux binding works while focus is in
-        # the claude pane (a tmux binding, not a Textual one), so surface it here.
-        yield Static("enter a worktree → full-screen workspace · prefix + m returns here", id="menuhint")
+        # Quiet status line: live running count, current selection, host + clock,
+        # and the back-to-menu hint (a tmux binding that works from the claude
+        # pane, so it belongs here rather than in the Textual footer).
+        yield Static(id="statusline")
         yield Footer()
 
     def on_mount(self) -> None:
+        # Enverus-green dark theme drives every stock widget (header, footer,
+        # modals, command palette, keys panel) in one move.
+        self.register_theme(CLAUDE_MUX_THEME)
+        self.theme = "claude-mux"
         self._tree = self.query_one(Tree)
+        self._tree.root.set_label(Text.assemble(("◈ ", _GREEN), ("Projects", f"bold {_MUTED}")))
         self._tree.root.expand()
         self.sub_title = "popup" if self.popup else "dashboard"
+        self._refresh_statusline()
         # First paint immediately, then hybrid refresh: slow safety poll + a
         # fast Events File watcher for near-instant `waiting` transitions.
         self._trigger_refresh()
@@ -394,7 +628,8 @@ class ClaudeMuxApp(App):
         self.call_from_thread(self._rebuild_tree, projects, gen)
 
     def _watch_events(self) -> None:
-        """Cheap tick: refresh only when the Events File has changed."""
+        """Cheap tick: keep the clock live, refresh only when Events File changed."""
+        self._refresh_statusline()
         try:
             path = panemap.events_path()
             mtime = path.stat().st_mtime if path.exists() else 0.0
@@ -444,13 +679,15 @@ class ClaudeMuxApp(App):
         restore = None
         for project in projects:
             expand = project.root not in self._collapsed_projects
-            pnode = tree.root.add(project_label(project), data=project, expand=expand)
+            pnode = tree.root.add(project_rich_label(project), data=project, expand=expand)
             if selected_project is not None and project.root == selected_project:
                 restore = pnode
             for wt in project.worktrees:
-                wnode = pnode.add_leaf(worktree_label(wt), data=wt)
+                wnode = pnode.add_leaf(worktree_rich_label(wt), data=wt)
                 if selected_path is not None and wt.path == selected_path:
                     restore = wnode
+
+        self._refresh_statusline()
 
         if restore is not None:
             # Defer the cursor restore: freshly-added nodes have no computed
@@ -464,6 +701,57 @@ class ClaudeMuxApp(App):
                     pass
 
             self.call_after_refresh(_restore)
+
+    # -- status line -------------------------------------------------------- #
+
+    def _status_text(self) -> Text:
+        """The quiet status line: running count · selection · host · clock.
+
+        This is the design's replacement for the loud full-width green tmux bar —
+        the same facts, carried by one accent and hairline separators.
+        """
+        running = sum(
+            1
+            for project in self._projects
+            for wt in project.worktrees
+            if wt.lifecycle is Lifecycle.LIVE
+            and wt.live is not None
+            and wt.live.activity is Activity.RUNNING
+        )
+        text = Text(no_wrap=True)
+        text.append("● ", style=_GREEN if running else _FAINT)
+        text.append(
+            f"{running} running", style=_GREEN if running else _DIM
+        )
+
+        wt = self._current_worktree()
+        project = self._current_project()
+        if wt is not None and project is not None:
+            text.append("  ·  ", style=_SEP)
+            text.append(f"{project.name}/{wt.branch or wt.path.name}", style=_MUTED)
+        elif project is not None:
+            text.append("  ·  ", style=_SEP)
+            text.append(project.name, style=_MUTED)
+
+        text.append("  ·  ", style=_SEP)
+        text.append("prefix + m", style=_TEXT)
+        text.append(" returns here", style=_DIM)
+
+        text.append("  ·  ", style=_SEP)
+        text.append(self._host, style=_MUTED)
+        text.append("  ·  ", style=_SEP)
+        text.append(datetime.now().strftime("%H:%M"), style=_DIM)
+        return text
+
+    def _refresh_statusline(self) -> None:
+        try:
+            self.query_one("#statusline", Static).update(self._status_text())
+        except Exception:
+            pass  # status line is decorative; never let it disrupt the UI
+
+    def on_tree_node_highlighted(self, event: Tree.NodeHighlighted) -> None:
+        # Keep the "current selection" segment in step with cursor movement.
+        self._refresh_statusline()
 
     # -- selection helpers -------------------------------------------------- #
 
@@ -678,11 +966,19 @@ class ClaudeMuxApp(App):
             self.notify("Select a project or worktree first", severity="warning")
             return
 
-        def on_branch(branch: Optional[str]) -> None:
-            if branch:
-                self._do_new_worktree(project, branch)
+        try:
+            branches = git.list_branches(project.root)
+            default_base = git.default_base_branch(project.root, self.config.base_branch)
+        except Exception as exc:
+            self.notify(f"could not read branches: {exc}", severity="error")
+            branches, default_base = [], self.config.base_branch
 
-        self.push_screen(BranchPromptScreen(), on_branch)
+        def on_branch(result: Optional[tuple[str, str]]) -> None:
+            if result:
+                branch, base = result
+                self._do_new_worktree(project, branch, base)
+
+        self.push_screen(BranchPromptScreen(branches, default_base), on_branch)
 
     def action_close(self) -> None:
         wt = self._current_worktree()
@@ -826,10 +1122,10 @@ class ClaudeMuxApp(App):
         self._after_navigation()
 
     @work(thread=True, group="lifecycle")
-    def _do_new_worktree(self, project: Project, branch: str) -> None:
+    def _do_new_worktree(self, project: Project, branch: str, base: str) -> None:
         try:
             with self._lifecycle_lock:
-                activate.new_worktree(project, branch, self.config)
+                activate.new_worktree(project, branch, self.config, base=base)
         except Exception as exc:
             self.call_from_thread(
                 self.notify, f"new worktree failed: {exc}", severity="error"

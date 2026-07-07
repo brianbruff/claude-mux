@@ -85,6 +85,39 @@ def list_worktrees(project_root: Path) -> list[Worktree]:
     return _parse_worktree_porcelain(output, project_root)
 
 
+# Preference order for the base a new worktree branches off. ``develop`` first
+# because in a git-flow repo that is where features branch from; ``main``/``master``
+# next for GitHub-flow / trunk-based repos that have no ``develop``. This is a
+# deliberate replacement for basing off ``HEAD`` (whatever happens to be checked
+# out), which silently branches a feature off ``main`` right after a release.
+PREFERRED_BASE_BRANCHES = ("develop", "main", "master")
+
+
+def list_branches(project_root: Path) -> list[str]:
+    """Return local branch names, in git's own ordering, with no markers.
+
+    Pure listing via ``git branch --format`` — no current-branch ``*`` prefix to
+    strip and no leading whitespace, so each line is a usable branch name.
+    """
+    output = _run_git(project_root, "branch", "--format=%(refname:short)")
+    return [line.strip() for line in output.splitlines() if line.strip()]
+
+
+def default_base_branch(project_root: Path, fallback: str = "HEAD") -> str:
+    """Pick the base branch a new worktree should default to.
+
+    Prefers ``develop`` (git-flow feature base), then ``main``/``master`` (trunk),
+    falling back to ``fallback`` when none of those exist — e.g. an unusual or
+    freshly-initialised repo. ``fallback`` is normally ``config.base_branch`` so an
+    explicitly-configured base still wins when the preferred branches are absent.
+    """
+    branches = set(list_branches(project_root))
+    for name in PREFERRED_BASE_BRANCHES:
+        if name in branches:
+            return name
+    return fallback
+
+
 def add_worktree(project_root: Path, branch: str, pattern: str, base: str) -> Path:
     """Create a new git worktree and return its path.
 

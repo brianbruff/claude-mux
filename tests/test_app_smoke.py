@@ -34,7 +34,8 @@ def test_app_composes_with_no_projects() -> None:
 
             tree = app.query_one(Tree)
             assert tree is app._tree
-            assert str(tree.root.label) == "Projects"
+            # Root carries the styled "◈ Projects" rail header (see TUI restyle).
+            assert "Projects" in str(tree.root.label)
 
             # Empty config -> a snapshot with no Project rows, app still alive.
             assert app._projects == []

@@ -96,6 +96,61 @@ def test_parse_porcelain_bare_is_primary():
     assert wts[0].is_primary is True
 
 
+# --- git.list_branches / default_base_branch --------------------------------
+
+import subprocess
+
+
+def _init_repo(root: Path, branches: tuple[str, ...]) -> Path:
+    """Init a repo whose first-listed branch is the initial commit's branch.
+
+    Extra branches are created (empty, off the first) so ``list_branches`` sees
+    them. Returns ``root``.
+    """
+    def run(*args: str) -> None:
+        subprocess.run(["git", *args], cwd=str(root), check=True,
+                       capture_output=True, text=True)
+
+    run("init", "-b", branches[0])
+    run("config", "user.email", "t@t.t")
+    run("config", "user.name", "t")
+    run("commit", "--allow-empty", "-m", "init")
+    for name in branches[1:]:
+        run("branch", name)
+    return root
+
+
+def test_list_branches_returns_all_local(tmp_path):
+    _init_repo(tmp_path, ("main", "develop", "feature/x"))
+    assert set(git.list_branches(tmp_path)) == {"main", "develop", "feature/x"}
+
+
+def test_default_base_prefers_develop(tmp_path):
+    _init_repo(tmp_path, ("main", "develop"))
+    assert git.default_base_branch(tmp_path) == "develop"
+
+
+def test_default_base_falls_back_to_main(tmp_path):
+    _init_repo(tmp_path, ("main", "feature/x"))
+    assert git.default_base_branch(tmp_path) == "main"
+
+
+def test_default_base_prefers_main_over_master(tmp_path):
+    _init_repo(tmp_path, ("master", "main"))
+    assert git.default_base_branch(tmp_path) == "main"
+
+
+def test_default_base_uses_master_when_only_option(tmp_path):
+    _init_repo(tmp_path, ("master",))
+    assert git.default_base_branch(tmp_path) == "master"
+
+
+def test_default_base_uses_fallback_when_none_preferred(tmp_path):
+    _init_repo(tmp_path, ("trunk", "feature/x"))
+    assert git.default_base_branch(tmp_path, fallback="trunk") == "trunk"
+    assert git.default_base_branch(tmp_path) == "HEAD"
+
+
 # --- config.load_config -----------------------------------------------------
 
 def test_load_config_missing_file(tmp_path):

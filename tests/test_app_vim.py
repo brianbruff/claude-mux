@@ -181,7 +181,7 @@ def test_keys_do_not_fire_inside_modal_input() -> None:
             await pilot.pause()
             cursor_before = app._tree.cursor_line
 
-            app.push_screen(BranchPromptScreen())
+            app.push_screen(BranchPromptScreen(["main", "develop"], "develop"))
             await pilot.pause()
             inp = app.screen.query_one(Input)
             assert inp.has_focus
@@ -195,5 +195,53 @@ def test_keys_do_not_fire_inside_modal_input() -> None:
             assert app._tree.cursor_line == cursor_before, (
                 "tree cursor moved while a modal Input was focused"
             )
+
+    _run(scenario())
+
+
+def test_branch_prompt_returns_branch_and_selected_base() -> None:
+    """Submitting yields (branch, base); the base defaults to the preselected one
+    and follows the dropdown when changed."""
+    from textual.widgets import Select
+
+    async def scenario() -> None:
+        app = _new_app()
+        results: list = []
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            app.push_screen(
+                BranchPromptScreen(["main", "develop", "master"], "develop"),
+                results.append,
+            )
+            await pilot.pause()
+
+            # Default base is the preselected develop.
+            assert app.screen.query_one("#base", Select).value == "develop"
+
+            # Type a branch, switch the base to main (a hotfix off trunk), submit.
+            app.screen.query_one(Input).value = "hotfix/urgent"
+            app.screen.query_one("#base", Select).value = "main"
+            await pilot.pause()
+            await pilot.press("enter")
+            await pilot.pause()
+
+        assert results == [("hotfix/urgent", "main")]
+
+    _run(scenario())
+
+
+def test_branch_prompt_offers_fallback_base_not_in_branches() -> None:
+    """A default_base absent from the branch list (e.g. the HEAD fallback) is still
+    selectable and preselected."""
+    from textual.widgets import Select
+
+    async def scenario() -> None:
+        app = _new_app()
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            app.push_screen(BranchPromptScreen([], "HEAD"))
+            await pilot.pause()
+            sel = app.screen.query_one("#base", Select)
+            assert sel.value == "HEAD"
 
     _run(scenario())

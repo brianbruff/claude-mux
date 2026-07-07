@@ -403,11 +403,45 @@ def ensure_menu_session(menu_cmd: str | None = None, terminal_cwd: Path | None =
     server = _server()
     if not (server.is_alive() and server.has_session(MUX_SESSION)):
         server.cmd("new-session", "-d", "-s", MUX_SESSION, "-n", "menu", menu_cmd)
+        _style_status_bar(server)
         ensure_menu_terminal(terminal_cwd)
         return
     if find_window(MUX_SESSION, "menu") is None:
         server.cmd("new-window", "-d", "-t", MUX_SESSION, "-n", "menu", menu_cmd)
+    _style_status_bar(server)
     ensure_menu_terminal(terminal_cwd)
+
+
+# Quiet, informative status bar (claude-mux TUI.dc.html, screen 1g): the loud
+# full-width green tmux default becomes a dark hairline with one green accent.
+# Every option is scoped to ``-t MUX_SESSION`` so the operator's own tmux config
+# and other sessions are never touched.
+_STATUS_OPTIONS: list[tuple[str, str]] = [
+    ("status-style", "bg=#141618,fg=#8b9298"),
+    ("status-left", "#[fg=#6cbf3f,bold] claude-mux #[default]"),
+    ("status-left-length", "24"),
+    ("status-right", "#[fg=#9aa1a8]#h #[fg=#4a5157]· #[fg=#8b9298]%H:%M "),
+    ("status-right-length", "40"),
+    ("window-status-format", " #I:#W "),
+    ("window-status-style", "fg=#8b9298"),
+    ("window-status-current-format", " #I:#W "),
+    ("window-status-current-style", "fg=#6cbf3f,bg=#1b1d1f,bold"),
+    ("message-style", "bg=#3C8321,fg=#ffffff"),
+]
+
+
+def _style_status_bar(server: "libtmux.Server") -> None:
+    """Apply the quiet dark status bar to the owned session (best effort).
+
+    Session-scoped and idempotent — safe to re-run on every workspace open. Option
+    names are stable across modern tmux, but any failure is swallowed so styling
+    can never block session bootstrap.
+    """
+    for option, value in _STATUS_OPTIONS:
+        try:
+            server.cmd("set-option", "-t", MUX_SESSION, option, value)
+        except Exception:
+            pass
 
 
 def ensure_menu_terminal(cwd: Path | None = None, percentage: int = MENU_TERMINAL_PERCENT) -> None:

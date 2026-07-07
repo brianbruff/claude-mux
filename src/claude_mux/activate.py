@@ -17,6 +17,7 @@ Layering:
 from __future__ import annotations
 
 import hashlib
+from typing import Optional
 
 from claude_mux import git, layouts, sessions, tmux
 from claude_mux.config import Config
@@ -129,14 +130,19 @@ def activate(worktree: Worktree, config: Config, resume: bool = True) -> None:
     _open_or_select(worktree.project_name, worktree, config, resume)
 
 
-def new_worktree(project: Project, branch: str, config: Config) -> Worktree:
+def new_worktree(
+    project: Project, branch: str, config: Config, base: Optional[str] = None
+) -> Worktree:
     """Create a new git worktree (DORMANT) and activate it.
 
     Delegates path construction + branch sanitization to ``git.add_worktree`` (which
-    expands ``config.worktree_pattern`` off ``config.base_branch``), builds the Dormant
-    Worktree, then Activates it to Live.
+    expands ``config.worktree_pattern``), builds the Dormant Worktree, then Activates
+    it to Live. ``base`` is the commit-ish the new branch is created off; when omitted
+    it falls back to ``config.base_branch`` (preserving the pre-dropdown behaviour).
     """
-    path = git.add_worktree(project.root, branch, config.worktree_pattern, config.base_branch)
+    path = git.add_worktree(
+        project.root, branch, config.worktree_pattern, base or config.base_branch
+    )
 
     worktree = Worktree(
         project_name=project.name,
