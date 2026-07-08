@@ -6,7 +6,7 @@ from pathlib import Path
 
 from claude_mux import git, panemap, scrape, sessions, status, tmux
 from claude_mux.config import Config
-from claude_mux.model import Activity, Lifecycle, SessionMeta, Worktree
+from claude_mux.model import Activity, AgentKind, Lifecycle, SessionMeta, Worktree
 from claude_mux.panemap import PaneMapEntry, StatusEvent
 from claude_mux.scrape import ScrapeResult
 from claude_mux.tmux import PaneInfo
@@ -36,9 +36,20 @@ def _wt(path, branch="main", primary=False, slug="slug"):
 
 def _install(monkeypatch, *, worktrees, panes, pane_map=None, events=None,
              index=None, footer=None):
+    # Faithful stand-in for the real classify_agent: claude/node -> CLAUDE, the
+    # named agents -> their kind, everything else -> None. StatusEngine calls
+    # tmux.classify_agent (is_claude_command is now just a wrapper), so this is
+    # the setattr that actually drives detection.
+    _kinds = {
+        "claude": AgentKind.CLAUDE,
+        "node": AgentKind.CLAUDE,
+        "gemini": AgentKind.GEMINI,
+        "codex": AgentKind.CODEX,
+    }
     monkeypatch.setattr(git, "list_worktrees", lambda root: list(worktrees))
     monkeypatch.setattr(tmux, "list_panes", lambda: list(panes))
-    monkeypatch.setattr(tmux, "is_claude_command", lambda c: c in ("claude", "node"))
+    monkeypatch.setattr(tmux, "classify_agent", lambda c: _kinds.get(c))
+    monkeypatch.setattr(tmux, "is_claude_command", lambda c: _kinds.get(c) is AgentKind.CLAUDE)
     monkeypatch.setattr(tmux, "capture_pane", lambda pid, lines=8: "footer")
     monkeypatch.setattr(panemap, "read_pane_map", lambda: dict(pane_map or {}))
     monkeypatch.setattr(panemap, "read_events", lambda since_ts=0.0: list(events or []))
@@ -133,6 +144,85 @@ def test_scrape_waiting_fallback_and_extras(monkeypatch, tmp_path):
     assert live.context_pct == 5
     assert live.cost_usd == 1.04
     assert live.elapsed == "2m 59s"
+
+
+def test_multiple_agents_one_worktree(monkeypatch, tmp_path):
+    """A claude pane and a gemini pane in the same dir -> two agents; claude primary."""
+    wtdir = tmp_path / "wt"
+    wt = _wt(wtdir, slug="the-slug")
+    meta = SessionMeta(
+        session_id="AUTH", summary="claude convo", first_prompt="p", message_count=3,
+        modified=time.time(), git_branch="main",
+        project_path=wtdir, jsonl_path=tmp_path / "a.jsonl",
+    )
+    _install(
+        monkeypatch,
+        worktrees=[wt],
+        panes=[_pane("%1", wtdir, cmd="claude"), _pane("%2", wtdir, cmd="gemini")],
+        pane_map={"%1": PaneMapEntry("%1", "AUTH", wtdir, 1.0)},
+        index=[meta],
+    )
+    eng = status.StatusEngine(Config(projects=[tmp_path]))
+    wt_out = eng.snapshot()[0].worktrees[0]
+
+    assert wt_out.lifecycle is Lifecycle.LIVE
+    assert len(wt_out.agents) == 2
+    kinds = {a.kind for a in wt_out.agents}
+    assert kinds == {AgentKind.CLAUDE, AgentKind.GEMINI}
+
+    # Primary is the claude agent, carrying full identity.
+    assert wt_out.live.kind is AgentKind.CLAUDE
+    assert wt_out.live.session_id == "AUTH"
+    assert wt_out.live.summary == "claude convo"
+
+    gemini = next(a for a in wt_out.agents if a.kind is AgentKind.GEMINI)
+    assert gemini.session_id is None
+    assert gemini.summary is None
+    assert gemini.idle_seconds is None
+    assert gemini.activity is Activity.UNKNOWN  # foreign agents stay UNKNOWN in v1
+
+
+def test_foreign_only_worktree(monkeypatch, tmp_path):
+    """A worktree with only a non-claude agent is LIVE with that agent primary."""
+    wtdir = tmp_path / "wt"
+    wt = _wt(wtdir, slug="the-slug")
+    _install(monkeypatch, worktrees=[wt], panes=[_pane("%7", wtdir, cmd="codex")])
+    eng = status.StatusEngine(Config(projects=[tmp_path]))
+    wt_out = eng.snapshot()[0].worktrees[0]
+
+    assert wt_out.lifecycle is Lifecycle.LIVE
+    assert len(wt_out.agents) == 1
+    assert wt_out.live is wt_out.agents[0]
+    assert wt_out.live.kind is AgentKind.CODEX
+    assert wt_out.live.session_id is None
+    assert wt_out.live.activity is Activity.UNKNOWN
+
+
+def test_two_hookless_claudes_only_first_gets_session(monkeypatch, tmp_path):
+    """Two hookless claude panes in one dir: only the first borrows the newest session."""
+    wtdir = tmp_path / "wt"
+    wt = _wt(wtdir, slug="the-slug")
+    meta = SessionMeta(
+        session_id="ONLY", summary="the convo", first_prompt="p", message_count=1,
+        modified=time.time(), git_branch="main",
+        project_path=wtdir, jsonl_path=tmp_path / "a.jsonl",
+    )
+    # No pane_map -> both panes are hookless and fall to the newest-session heuristic.
+    _install(
+        monkeypatch,
+        worktrees=[wt],
+        panes=[_pane("%1", wtdir, cmd="claude"), _pane("%2", wtdir, cmd="claude")],
+        index=[meta],
+    )
+    eng = status.StatusEngine(Config(projects=[tmp_path]))
+    wt_out = eng.snapshot()[0].worktrees[0]
+
+    assert len(wt_out.agents) == 2
+    with_session = [a for a in wt_out.agents if a.session_id == "ONLY"]
+    without = [a for a in wt_out.agents if a.session_id is None]
+    assert len(with_session) == 1  # the newest session is not duplicated
+    assert len(without) == 1
+    assert without[0].summary is None
 
 
 def test_dependency_failure_degrades_gracefully(monkeypatch, tmp_path):

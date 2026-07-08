@@ -30,6 +30,23 @@ class Activity(str, Enum):
     UNKNOWN = "unknown"
 
 
+class AgentKind(str, Enum):
+    """Which AI coding agent is running in a pane.
+
+    ``claude`` is the fully-supported agent (session index + hooks + scrape). The
+    others are detected by process name and shown scrape-only — no conversation
+    summary, no ``--resume``. ``UNKNOWN`` is reserved; ``tmux.classify_agent``
+    returns ``None`` (not ``UNKNOWN``) for a pane that is not a known agent.
+    """
+
+    CLAUDE = "claude"
+    GEMINI = "gemini"
+    CODEX = "codex"
+    COPILOT = "copilot"
+    OPENCODE = "opencode"
+    UNKNOWN = "unknown"
+
+
 @dataclass
 class SessionMeta:
     """One entry decoded from a project slug's sessions-index.json."""
@@ -45,14 +62,20 @@ class SessionMeta:
 
 
 @dataclass
-class LiveClaude:
-    """A tmux pane running `claude`, enriched with session + scrape data."""
+class LiveAgent:
+    """A tmux pane running an AI coding agent, enriched with session + scrape data.
+
+    ``kind`` distinguishes claude (full metadata) from the detected-only agents
+    (gemini/codex/copilot/opencode), which carry ``kind`` + scrape extras but no
+    ``session_id``/``summary``/``idle_seconds``.
+    """
 
     pane_id: str          # tmux unique pane id, e.g. '%12'
     session_name: str     # tmux session name
     window_index: int
     pid: int
     cwd: Path
+    kind: "AgentKind" = AgentKind.CLAUDE
     session_id: Optional[str] = None  # from Pane Map (authoritative) or heuristic
     activity: Activity = Activity.UNKNOWN
     summary: Optional[str] = None     # from SessionMeta
@@ -61,6 +84,11 @@ class LiveClaude:
     cost_usd: Optional[float] = None   # scrape extra
     elapsed: Optional[str] = None      # scrape extra, raw e.g. "2m 59s"
     idle_seconds: Optional[int] = None
+
+
+# Back-compat alias: the type was single-agent (claude-only) before multi-agent
+# support. Existing imports/constructions of ``LiveClaude`` keep working.
+LiveClaude = LiveAgent
 
 
 @dataclass
@@ -83,5 +111,9 @@ class Worktree:
     is_primary: bool = False
     slug: str = ""  # claude Project Slug for this path
     lifecycle: Lifecycle = Lifecycle.DORMANT
-    live: Optional[LiveClaude] = None
+    # ``live`` is the PRIMARY agent (claude if present, else the first agent) and
+    # backs the single-line row + status counts. ``agents`` is every agent pane in
+    # this worktree and backs the detail panel; ``live`` is one of ``agents``.
+    live: Optional[LiveAgent] = None
+    agents: list["LiveAgent"] = field(default_factory=list)
     latest_session: Optional[SessionMeta] = None

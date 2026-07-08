@@ -4,7 +4,19 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Optional
 
-from claude_mux.tmux import _cmd_failed, is_claude_command, launch_command_string
+from pathlib import Path
+
+from claude_mux.model import AgentKind
+from claude_mux.tmux import (
+    PaneInfo,
+    ProcSnapshot,
+    _cmd_failed,
+    classify_agent,
+    classify_command_line,
+    classify_pane,
+    is_claude_command,
+    launch_command_string,
+)
 
 
 def test_literal_claude_and_node():
@@ -35,6 +47,121 @@ def test_empty_and_garbage():
     assert is_claude_command("   ") is False
     assert is_claude_command("2.x.1") is False
     assert is_claude_command("v") is False
+
+
+# --- classify_agent ---------------------------------------------------------
+# is_claude_command is now a thin wrapper over classify_agent; these lock the
+# multi-agent classification and prove the wrapper is unchanged for claude.
+
+
+def test_classify_claude_disguises():
+    assert classify_agent("claude") is AgentKind.CLAUDE
+    assert classify_agent("Claude") is AgentKind.CLAUDE  # case-insensitive
+    assert classify_agent("  node  ") is AgentKind.CLAUDE  # runtime disguise, whitespace
+    assert classify_agent("2.1.199") is AgentKind.CLAUDE  # semver disguise
+    assert classify_agent("v2.1.0") is AgentKind.CLAUDE
+
+
+def test_classify_other_agents():
+    assert classify_agent("gemini") is AgentKind.GEMINI
+    assert classify_agent("codex") is AgentKind.CODEX
+    assert classify_agent("copilot") is AgentKind.COPILOT
+    assert classify_agent("opencode") is AgentKind.OPENCODE
+    # case / whitespace tolerant
+    assert classify_agent("  GEMINI ") is AgentKind.GEMINI
+
+
+def test_classify_non_agents_are_none():
+    for cmd in ("zsh", "bash", "python", "nodejs", "yazi", "", "   "):
+        assert classify_agent(cmd) is None
+
+
+def test_is_claude_command_matches_classify():
+    # The wrapper agrees with classify_agent for the claude cases only.
+    assert is_claude_command("claude") is True
+    assert is_claude_command("gemini") is False
+    assert is_claude_command("zsh") is False
+
+
+# --- classify_command_line --------------------------------------------------
+# argv0 alone cannot tell claude from the other node-hosted agents; the full
+# command line can, via the hosted script's basename.
+
+
+def test_classify_command_line_direct_binaries():
+    assert classify_command_line("claude --model opus") is AgentKind.CLAUDE
+    assert classify_command_line("codex") is AgentKind.CODEX
+    assert classify_command_line("/opt/homebrew/bin/copilot") is AgentKind.COPILOT
+
+
+def test_classify_command_line_node_hosted_agents():
+    # The regression: copilot runs as `node <path>/copilot`, not `copilot`.
+    assert classify_command_line("node /opt/homebrew/bin/copilot") is AgentKind.COPILOT
+    assert classify_command_line("node /usr/local/bin/gemini") is AgentKind.GEMINI
+    assert classify_command_line("node --enable-source-maps /x/opencode.js") is AgentKind.OPENCODE
+
+
+def test_classify_command_line_claude_and_bare_node_stay_claude():
+    # claude under node, and any unrecognised bare-node process, remain CLAUDE
+    # (matching the argv0-only fallback — no worse than before).
+    assert classify_command_line("node /Users/x/.claude/local/cli.js") is AgentKind.CLAUDE
+    assert classify_command_line("node /Users/x/proj/node_modules/.bin/vite") is AgentKind.CLAUDE
+    assert classify_command_line("2.1.204") is AgentKind.CLAUDE
+
+
+def test_classify_command_line_non_agents_are_none():
+    for cmd in ("zsh -i", "python app.py", "", "   "):
+        assert classify_command_line(cmd) is None
+
+
+# --- classify_pane ----------------------------------------------------------
+
+
+def _pane(cmd: str, pid: int) -> PaneInfo:
+    return PaneInfo(
+        pane_id="%1",
+        session_name="s",
+        window_index=0,
+        pane_index=0,
+        current_command=cmd,
+        pid=pid,
+        current_path=Path("."),
+    )
+
+
+def test_classify_pane_disambiguates_node_copilot_from_claude():
+    # Pane shell (100) forks `node <path>/copilot` (200); tmux only sees "node".
+    procs = ProcSnapshot(
+        args_by_pid={100: "-zsh", 200: "node /opt/homebrew/bin/copilot"},
+        children={100: [200]},
+    )
+    assert classify_pane(_pane("node", 100), procs) is AgentKind.COPILOT
+
+
+def test_classify_pane_semver_claude_stays_claude():
+    procs = ProcSnapshot(
+        args_by_pid={100: "/bin/zsh -i -c claude", 200: "claude --model opus"},
+        children={100: [200]},
+    )
+    assert classify_pane(_pane("2.1.204", 100), procs) is AgentKind.CLAUDE
+
+
+def test_classify_pane_exact_binary_skips_process_tree():
+    # A literal agent argv0 is trusted outright — no tree walk, empty snapshot ok.
+    empty = ProcSnapshot(args_by_pid={}, children={})
+    assert classify_pane(_pane("codex", 100), empty) is AgentKind.CODEX
+    assert classify_pane(_pane("copilot", 100), empty) is AgentKind.COPILOT
+
+
+def test_classify_pane_falls_back_to_claude_when_tree_empty():
+    # No descendants resolvable (ps failed) -> preserve argv0 fallback (CLAUDE).
+    empty = ProcSnapshot(args_by_pid={}, children={})
+    assert classify_pane(_pane("node", 100), empty) is AgentKind.CLAUDE
+
+
+def test_classify_pane_non_agent_is_none():
+    empty = ProcSnapshot(args_by_pid={}, children={})
+    assert classify_pane(_pane("zsh", 100), empty) is None
 
 
 # --- launch_command_string --------------------------------------------------

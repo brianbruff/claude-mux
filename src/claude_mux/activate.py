@@ -170,6 +170,7 @@ def close_workspace(worktree: Worktree) -> None:
         pass
 
     worktree.live = None
+    worktree.agents = []
     worktree.lifecycle = Lifecycle.DORMANT
 
 

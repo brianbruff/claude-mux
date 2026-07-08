@@ -16,8 +16,9 @@ from claude_mux import git, panemap, scrape, sessions, tmux
 from claude_mux.config import Config
 from claude_mux.model import (
     Activity,
+    AgentKind,
     Lifecycle,
-    LiveClaude,
+    LiveAgent,
     Project,
     SessionMeta,
     Worktree,
@@ -69,16 +70,20 @@ class StatusEngine:
         pane_map = self._safe(panemap.read_pane_map, default={})
         latest_events = self._latest_events_by_pane()
 
-        claude_panes = [p for p in panes if self._is_claude_pane(p)]
+        # One process-table snapshot for this build; shared by every _agent_kind
+        # call so node-hosted agents are disambiguated without re-running `ps`.
+        self._procs = self._safe(tmux.capture_processes, default=None)
+
+        agent_panes = [p for p in panes if self._agent_kind(p) is not None]
 
         projects: list[Project] = []
         for root in self.config.projects:
             projects.append(
-                self._build_project(root, panes, claude_panes, pane_map, latest_events)
+                self._build_project(root, panes, agent_panes, pane_map, latest_events)
             )
         return projects
 
-    def refresh_scrape(self, live: LiveClaude) -> None:
+    def refresh_scrape(self, live: LiveAgent) -> None:
         """Capture the pane and parse the footer to fill scrape extras on a LiveClaude."""
         self._apply_scrape(live)
 
@@ -88,7 +93,7 @@ class StatusEngine:
         self,
         root: Path,
         panes: list[PaneInfo],
-        claude_panes: list[PaneInfo],
+        agent_panes: list[PaneInfo],
         pane_map: dict,
         latest_events: dict,
     ) -> Project:
@@ -99,7 +104,7 @@ class StatusEngine:
         worktrees = self._safe(git.list_worktrees, root, default=[])
         for wt in worktrees:
             try:
-                self._resolve_worktree(wt, panes, claude_panes, pane_map, latest_events)
+                self._resolve_worktree(wt, panes, agent_panes, pane_map, latest_events)
             except Exception:
                 # A single worktree failing to resolve must not drop the project.
                 pass
@@ -110,7 +115,7 @@ class StatusEngine:
         self,
         wt: Worktree,
         panes: list[PaneInfo],
-        claude_panes: list[PaneInfo],
+        agent_panes: list[PaneInfo],
         pane_map: dict,
         latest_events: dict,
     ) -> None:
@@ -124,14 +129,38 @@ class StatusEngine:
         newest = self._newest(index)
         wt.latest_session = newest
 
-        claude_pane = self._match_pane(wt_path, claude_panes)
-        if claude_pane is not None:
+        # Collect EVERY agent pane sitting in this worktree (a worktree may host
+        # more than one agent). claude panes get the full identity/summary/idle/
+        # event logic; non-claude agents are kind + scrape only.
+        matched = [p for p in agent_panes if _resolve(p.current_path) == wt_path]
+        agents: list[LiveAgent] = []
+        # The newest-session heuristic may only be *borrowed* by the first hookless
+        # claude pane: two claudes in one dir would otherwise both adopt the same
+        # session and render as identical rows. Later hookless panes get no meta.
+        heuristic_taken = False
+        for pane in matched:
+            kind = self._agent_kind(pane)
+            if kind is AgentKind.CLAUDE:
+                agent = self._build_live(
+                    pane,
+                    wt,
+                    by_id,
+                    None if heuristic_taken else newest,
+                    pane_map,
+                    latest_events,
+                )
+                if pane.pane_id not in pane_map:
+                    heuristic_taken = True
+                agents.append(agent)
+            elif kind is not None:
+                agents.append(self._build_foreign_agent(pane, kind))
+
+        if agents:
             wt.lifecycle = Lifecycle.LIVE
-            wt.live = self._build_live(
-                claude_pane, wt, by_id, newest, pane_map, latest_events
-            )
+            wt.agents = agents
+            wt.live = self._pick_primary(agents)
         elif self._match_pane(wt_path, panes) is not None:
-            # A tmux pane sits in this worktree but no claude runs there.
+            # A tmux pane sits in this worktree but no agent runs there.
             wt.lifecycle = Lifecycle.OPEN
         else:
             wt.lifecycle = Lifecycle.DORMANT
@@ -146,7 +175,7 @@ class StatusEngine:
         newest: Optional[SessionMeta],
         pane_map: dict,
         latest_events: dict,
-    ) -> LiveClaude:
+    ) -> LiveAgent:
         # Identity: pane map is authoritative; else newest session for the slug.
         session_id: Optional[str] = None
         entry = pane_map.get(pane.pane_id)
@@ -165,12 +194,13 @@ class StatusEngine:
             meta = newest
         summary = meta.summary if meta is not None else None
 
-        live = LiveClaude(
+        live = LiveAgent(
             pane_id=pane.pane_id,
             session_name=pane.session_name,
             window_index=pane.window_index,
             pid=pane.pid,
             cwd=pane.current_path,
+            kind=AgentKind.CLAUDE,
             session_id=session_id,
             summary=summary,
         )
@@ -201,7 +231,39 @@ class StatusEngine:
 
     # ------------------------------------------------------------------ scrape
 
-    def _apply_scrape(self, live: LiveClaude) -> Optional[ScrapeResult]:
+    def _build_foreign_agent(self, pane: PaneInfo, kind: AgentKind) -> LiveAgent:
+        """Build a non-claude agent: kind + screen-scrape extras only.
+
+        Deliberately no ``session_id``/``summary``/``idle_seconds`` — those come
+        from claude-specific infra (session index, hooks, transcript mtime) the
+        other agents don't share. Activity defaults to ``UNKNOWN`` rather than
+        RUNNING: claude's footer regexes almost never match a foreign pane, so a
+        RUNNING default would show a permanent false "running", and the generic
+        prompt regexes can false-positive to "waiting" on an arbitrary TUI. A LIVE
+        worktree still shows a green marker; there is just no activity word.
+        Non-claude waiting-detection is out of scope for v1.
+        """
+        live = LiveAgent(
+            pane_id=pane.pane_id,
+            session_name=pane.session_name,
+            window_index=pane.window_index,
+            pid=pane.pid,
+            cwd=pane.current_path,
+            kind=kind,
+            activity=Activity.UNKNOWN,
+        )
+        self._apply_scrape(live)  # fills model/context/cost/elapsed if they parse
+        return live
+
+    @staticmethod
+    def _pick_primary(agents: list[LiveAgent]) -> LiveAgent:
+        """The representative agent for the row + status counts: claude if any."""
+        for agent in agents:
+            if agent.kind is AgentKind.CLAUDE:
+                return agent
+        return agents[0]
+
+    def _apply_scrape(self, live: LiveAgent) -> Optional[ScrapeResult]:
         """Capture + parse the footer, filling non-None extras. Never raises."""
         try:
             captured = tmux.capture_pane(live.pane_id)
@@ -226,11 +288,17 @@ class StatusEngine:
 
     # ------------------------------------------------------------------ helpers
 
-    def _is_claude_pane(self, pane: PaneInfo) -> bool:
+    def _agent_kind(self, pane: PaneInfo) -> Optional[AgentKind]:
+        """Classify a pane's foreground command into an AgentKind, or None.
+
+        Uses the full command line (via ``classify_pane``) so a node-hosted agent
+        (copilot/gemini/opencode) is not mistaken for claude's ``node`` disguise.
+        Reuses the per-snapshot process table cached in ``_procs``.
+        """
         try:
-            return bool(tmux.is_claude_command(pane.current_command))
+            return tmux.classify_pane(pane, getattr(self, "_procs", None))
         except Exception:
-            return False
+            return None
 
     @staticmethod
     def _match_pane(wt_path: Path, panes: list[PaneInfo]) -> Optional[PaneInfo]:

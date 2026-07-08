@@ -8,22 +8,36 @@ from __future__ import annotations
 
 from pathlib import Path
 
+from rich.console import Console
+
 from claude_mux.app import (
     activity_text,
     format_idle,
+    project_detail,
     project_label,
     scrape_extras,
+    worktree_detail,
     worktree_label,
+    worktree_rich_label,
     worktree_summary,
 )
 from claude_mux.model import (
     Activity,
+    AgentKind,
     Lifecycle,
     LiveClaude,
     Project,
     SessionMeta,
     Worktree,
 )
+
+
+def _plain(renderable) -> str:
+    """Render a Rich renderable to plain (style-stripped) text for assertions."""
+    console = Console(width=120, no_color=True)
+    with console.capture() as capture:
+        console.print(renderable)
+    return capture.get()
 
 
 def _live(**kw) -> LiveClaude:
@@ -141,6 +155,73 @@ def test_worktree_summary_falls_back_to_session():
 
 def test_worktree_summary_empty():
     assert worktree_summary(_wt()) == ""
+
+
+def test_worktree_summary_foreign_primary_does_not_leak_claude_session():
+    # A gemini-primary worktree must NOT show the claude Session Index summary.
+    wt = _wt(
+        live=_live(kind=AgentKind.GEMINI, summary=None),
+        latest_session=_session("a claude conversation"),
+    )
+    assert worktree_summary(wt) == ""
+
+
+# -- detail panel builders -------------------------------------------------- #
+
+
+def test_worktree_detail_dormant_hint():
+    out = _plain(worktree_detail(_wt(lifecycle=Lifecycle.DORMANT)))
+    assert "No agent running" in out
+
+
+def test_worktree_detail_single_claude_shows_summary_and_chips():
+    agent = _live(
+        kind=AgentKind.CLAUDE, activity=Activity.RUNNING,
+        summary="refactor status engine", model="Opus 4.8", cost_usd=1.04,
+    )
+    wt = _wt(lifecycle=Lifecycle.LIVE, live=agent, agents=[agent])
+    out = _plain(worktree_detail(wt))
+    assert "claude" in out
+    assert "refactor status engine" in out
+    assert "Opus 4.8" in out
+    assert "$1.04" in out
+
+
+def test_worktree_detail_multi_agent_lists_both_kinds():
+    claude = _live(kind=AgentKind.CLAUDE, activity=Activity.RUNNING, summary="c")
+    gemini = _live(kind=AgentKind.GEMINI, activity=Activity.UNKNOWN)
+    wt = _wt(lifecycle=Lifecycle.LIVE, live=claude, agents=[claude, gemini])
+    out = _plain(worktree_detail(wt))
+    assert "2 agents" in out
+    assert "claude" in out
+    assert "gemini" in out
+
+
+def test_project_detail_counts_and_kinds():
+    claude = _live(kind=AgentKind.CLAUDE)
+    gemini = _live(kind=AgentKind.GEMINI)
+    live_wt = _wt(lifecycle=Lifecycle.LIVE, live=claude, agents=[claude, gemini])
+    dormant_wt = _wt(lifecycle=Lifecycle.DORMANT)
+    project = Project(name="proj", root=Path("/tmp/proj"), worktrees=[live_wt, dormant_wt])
+    out = _plain(project_detail(project))
+    assert "2 worktrees" in out
+    assert "1 live" in out
+    assert "1 dormant" in out
+    assert "1 claude" in out
+    assert "1 gemini" in out
+
+
+def test_worktree_rich_label_multi_agent_badge():
+    claude = _live(kind=AgentKind.CLAUDE, activity=Activity.RUNNING, summary="should not show")
+    gemini = _live(kind=AgentKind.GEMINI, activity=Activity.UNKNOWN)
+    wt = _wt(
+        branch="feat", lifecycle=Lifecycle.LIVE, live=claude, agents=[claude, gemini],
+    )
+    label = str(worktree_rich_label(wt))
+    assert "2 agents" in label
+    # The single-agent summary/RUNNING tail is collapsed into the badge.
+    assert "should not show" not in label
+    assert "RUNNING" not in label
 
 
 # -- worktree_label --------------------------------------------------------- #

@@ -9,7 +9,9 @@ from __future__ import annotations
 
 import asyncio
 
-from textual.widgets import Footer, Header, Tree
+from rich.console import Console
+from textual.containers import VerticalScroll
+from textual.widgets import Footer, Header, Static, Tree
 
 from claude_mux.app import ClaudeMuxApp
 from claude_mux.config import Config
@@ -17,6 +19,13 @@ from claude_mux.config import Config
 
 def _run(coro) -> None:
     asyncio.run(coro)
+
+
+def _plain(renderable) -> str:
+    console = Console(width=120, no_color=True)
+    with console.capture() as capture:
+        console.print(renderable)
+    return capture.get()
 
 
 def test_app_composes_with_no_projects() -> None:
@@ -55,6 +64,111 @@ def test_app_composes_in_popup_mode() -> None:
             assert app.popup is True
             assert app.sub_title == "popup"
             assert app.query_one(Tree) is not None
+
+    _run(scenario())
+
+
+def test_detail_panel_present_and_tree_keeps_focus() -> None:
+    """The side detail panel mounts, is not focusable, and the Tree stays focused."""
+
+    async def scenario() -> None:
+        app = ClaudeMuxApp(Config(projects=[]))
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            assert app.query_one("#detail-body", Static) is not None
+            detail = app.query_one("#detail", VerticalScroll)
+            assert detail.can_focus is False
+            assert app.focused is app._tree
+
+    _run(scenario())
+
+
+def test_detail_panel_lists_every_agent_in_worktree() -> None:
+    """Selecting a multi-agent worktree renders every agent in the detail panel."""
+    from pathlib import Path
+
+    from claude_mux.model import AgentKind, Activity, Lifecycle, LiveAgent, Project, Worktree
+
+    def make_projects() -> list[Project]:
+        claude = LiveAgent(
+            pane_id="%1", session_name="p", window_index=0, pid=1, cwd=Path("/p/wt0"),
+            kind=AgentKind.CLAUDE, activity=Activity.RUNNING, summary="do the thing",
+        )
+        gemini = LiveAgent(
+            pane_id="%2", session_name="p", window_index=0, pid=2, cwd=Path("/p/wt0"),
+            kind=AgentKind.GEMINI, activity=Activity.UNKNOWN,
+        )
+        wt = Worktree(
+            project_name="p", path=Path("/p/wt0"), branch="branch0",
+            lifecycle=Lifecycle.LIVE, live=claude, agents=[claude, gemini],
+        )
+        return [Project(name="p", root=Path("/p"), session_name="p", worktrees=[wt])]
+
+    async def scenario() -> None:
+        app = ClaudeMuxApp(Config(projects=[]))
+        app.engine.snapshot = make_projects
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            wnode = app._tree.root.children[0].children[0]
+            app._tree.move_cursor(wnode)  # fires NodeHighlighted -> _refresh_detail
+            await pilot.pause()
+            out = _plain(app._detail_renderable)
+            assert "2 agents" in out
+            assert "claude" in out
+            assert "gemini" in out
+            # And the row itself carries the count badge.
+            assert "2 agents" in str(wnode.label)
+
+    _run(scenario())
+
+
+def test_closed_worktree_shows_no_ghost_agents() -> None:
+    """Regression (stale-agents bug): after a worktree goes DORMANT with agents
+    cleared, the row shows no 'N agents' badge and the panel shows the dormant hint."""
+    from pathlib import Path
+
+    from claude_mux.model import AgentKind, Activity, Lifecycle, LiveAgent, Project, Worktree
+
+    def make_live() -> list[Project]:
+        claude = LiveAgent(
+            pane_id="%1", session_name="p", window_index=0, pid=1, cwd=Path("/p/wt0"),
+            kind=AgentKind.CLAUDE, activity=Activity.RUNNING,
+        )
+        gemini = LiveAgent(
+            pane_id="%2", session_name="p", window_index=0, pid=2, cwd=Path("/p/wt0"),
+            kind=AgentKind.GEMINI, activity=Activity.UNKNOWN,
+        )
+        wt = Worktree(
+            project_name="p", path=Path("/p/wt0"), branch="branch0",
+            lifecycle=Lifecycle.LIVE, live=claude, agents=[claude, gemini],
+        )
+        return [Project(name="p", root=Path("/p"), session_name="p", worktrees=[wt])]
+
+    def make_dormant() -> list[Project]:
+        wt = Worktree(
+            project_name="p", path=Path("/p/wt0"), branch="branch0",
+            lifecycle=Lifecycle.DORMANT, live=None, agents=[],
+        )
+        return [Project(name="p", root=Path("/p"), session_name="p", worktrees=[wt])]
+
+    async def scenario() -> None:
+        app = ClaudeMuxApp(Config(projects=[]))
+        app.engine.snapshot = make_live
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            wnode = app._tree.root.children[0].children[0]
+            app._tree.move_cursor(wnode)
+            await pilot.pause()
+            assert "2 agents" in str(wnode.label)
+
+            app._rebuild_tree(make_dormant())  # simulate close + refresh
+            await pilot.pause()
+            await pilot.pause()  # let call_after_refresh restore + repaint
+
+            wnode_after = app._tree.root.children[0].children[0]
+            assert "agents" not in str(wnode_after.label)
+            out = _plain(app._detail_renderable)
+            assert "No agent running" in out
 
     _run(scenario())
 

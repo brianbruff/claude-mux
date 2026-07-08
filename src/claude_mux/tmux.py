@@ -13,6 +13,7 @@ from __future__ import annotations
 import os
 import re
 import shlex
+import subprocess
 import sys
 import time
 from dataclasses import dataclass
@@ -23,6 +24,7 @@ import libtmux
 from libtmux.constants import PaneDirection
 
 from claude_mux.layouts import LayoutPlan
+from claude_mux.model import AgentKind
 
 
 # The single dedicated tmux session claude-mux owns (ADR-0005). Module-level so
@@ -93,15 +95,199 @@ def _get_window(server: libtmux.Server, window_target: str) -> Optional[libtmux.
     return None
 
 
-def is_claude_command(cmd: str) -> bool:
-    """Return True if a pane command looks like a running claude ('claude', 'node', or semver)."""
+# Detected agent CLIs, keyed by their process (argv0) name. claude is handled
+# specially below (it also disguises as ``node`` / a bare semver). The rest are
+# detect + display only (see CONTEXT.md / the multi-agent plan): a matching pane
+# is shown scrape-only, never launched or resumed by claude-mux.
+#
+# Extension point (deferred): a future optional TOML ``[agents]`` table could be
+# merged over this map so an operator can register a custom agent command.
+_AGENT_COMMANDS: dict[str, AgentKind] = {
+    "claude": AgentKind.CLAUDE,
+    "gemini": AgentKind.GEMINI,
+    "codex": AgentKind.CODEX,
+    "copilot": AgentKind.COPILOT,
+    "opencode": AgentKind.OPENCODE,
+}
+
+
+def classify_agent(cmd: str) -> Optional[AgentKind]:
+    """Map a pane's ``current_command`` to an :class:`AgentKind`, else ``None``.
+
+    Exact (case/whitespace-tolerant) match on a known agent binary name; otherwise
+    a bare ``node`` or semver-shaped command is treated as claude (its runtime
+    disguises across versions; see ``_SEMVER_RE``).
+
+    Known limitation: this argv0-only view cannot tell claude apart from another
+    node-hosted CLI (copilot/gemini/opencode all exec under ``node``), nor from a
+    stray ``node`` (vite/webpack/jest) sitting in a worktree — all show as claude.
+    ``classify_pane`` resolves the node-hosted agents by inspecting the process's
+    full command line; use it when a pid is available.
+    """
     if not cmd:
-        return False
+        return None
     stripped = cmd.strip()
     lowered = stripped.lower()
-    if lowered in ("claude", "node"):
-        return True
-    return bool(_SEMVER_RE.match(stripped))
+    if lowered in _AGENT_COMMANDS:
+        return _AGENT_COMMANDS[lowered]
+    if _is_runtime_command(stripped):
+        return AgentKind.CLAUDE
+    return None
+
+
+def is_claude_command(cmd: str) -> bool:
+    """Return True if a pane command looks like a running claude ('claude', 'node', or semver)."""
+    return classify_agent(cmd) is AgentKind.CLAUDE
+
+
+def _is_runtime_command(cmd: str) -> bool:
+    """True for the ambiguous runtime argv0s (``node`` / bare semver) that claude
+    and the other node-hosted agents share — the cases only a full command line
+    can disambiguate."""
+    stripped = cmd.strip()
+    return stripped.lower() == "node" or bool(_SEMVER_RE.match(stripped))
+
+
+# Node (and semver-titled runtimes) host an agent whose true identity is the
+# script it runs, not argv0. Strip these extensions off a script path basename.
+_SCRIPT_EXT_RE = re.compile(r"\.(?:js|mjs|cjs|ts)$")
+
+
+def classify_command_line(command_line: str) -> Optional[AgentKind]:
+    """Classify an agent from a full command line (argv0 + arguments).
+
+    Extends :func:`classify_agent`: when argv0 is a runtime (``node``/semver),
+    the first positional argument is the hosted script, so its basename names the
+    real agent (e.g. ``node /opt/homebrew/bin/copilot`` -> COPILOT). A ``node``
+    with no recognised script (or a path mentioning claude) stays CLAUDE, matching
+    the argv0-only fallback. Returns ``None`` if nothing names a known agent.
+    """
+    if not command_line:
+        return None
+    try:
+        tokens = shlex.split(command_line)
+    except ValueError:
+        tokens = command_line.split()
+    if not tokens:
+        return None
+    argv0 = os.path.basename(tokens[0]).lower()
+    if argv0 in _AGENT_COMMANDS:
+        return _AGENT_COMMANDS[argv0]
+    if argv0 == "node" or _SEMVER_RE.match(tokens[0]):
+        for tok in tokens[1:]:
+            if tok.startswith("-"):
+                continue  # node runtime flag, not the script
+            base = _SCRIPT_EXT_RE.sub("", os.path.basename(tok)).lower()
+            if base in _AGENT_COMMANDS:
+                return _AGENT_COMMANDS[base]
+            if "claude" in tok.lower():
+                return AgentKind.CLAUDE
+            break  # first positional is the script path; look no further
+        return AgentKind.CLAUDE  # bare node with no known script -> assume claude
+    return None
+
+
+@dataclass
+class ProcSnapshot:
+    """A point-in-time view of the process table for parent/child resolution."""
+
+    args_by_pid: dict[int, str]
+    children: dict[int, list[int]]
+
+    def descendant_command_lines(self, root_pid: int) -> list[str]:
+        """Command lines of every process under ``root_pid``, breadth-first so a
+        pane's direct agent child is examined before deeper grandchildren."""
+        from collections import deque
+
+        seen: set[int] = set()
+        out: list[str] = []
+        queue: deque[int] = deque([root_pid])
+        while queue:
+            cur = queue.popleft()
+            for child in self.children.get(cur, ()):
+                if child in seen:
+                    continue
+                seen.add(child)
+                out.append(self.args_by_pid.get(child, ""))
+                queue.append(child)
+        return out
+
+
+# ``-axww`` (BSD/macOS) and ``-eww`` (GNU/Linux) both list every process with an
+# untruncated command line; we try each so the same code path works cross-platform.
+_PS_COMMANDS: tuple[list[str], ...] = (
+    ["ps", "-axww", "-o", "pid=,ppid=,args="],
+    ["ps", "-eww", "-o", "pid=,ppid=,args="],
+)
+
+
+def capture_processes() -> ProcSnapshot:
+    """Snapshot the process table (pid -> args, ppid -> children). Best-effort:
+    returns an empty snapshot if ``ps`` is unavailable or fails."""
+    for argv in _PS_COMMANDS:
+        try:
+            proc = subprocess.run(
+                argv, capture_output=True, text=True, timeout=2.0
+            )
+        except Exception:
+            continue
+        if proc.returncode != 0 or not proc.stdout:
+            continue
+        args_by_pid: dict[int, str] = {}
+        children: dict[int, list[int]] = {}
+        for line in proc.stdout.splitlines():
+            parts = line.split(maxsplit=2)
+            if len(parts) < 2:
+                continue
+            try:
+                pid = int(parts[0])
+                ppid = int(parts[1])
+            except ValueError:
+                continue
+            args_by_pid[pid] = parts[2] if len(parts) > 2 else ""
+            children.setdefault(ppid, []).append(pid)
+        if args_by_pid:
+            return ProcSnapshot(args_by_pid=args_by_pid, children=children)
+    return ProcSnapshot(args_by_pid={}, children={})
+
+
+def classify_pane(
+    pane: "PaneInfo", procs: Optional[ProcSnapshot] = None
+) -> Optional[AgentKind]:
+    """Classify a pane into an :class:`AgentKind`, disambiguating node-hosted agents.
+
+    Fast path is :func:`classify_agent` on the pane's foreground argv0. When that
+    argv0 is an ambiguous runtime (``node``/semver) the pane could be claude OR a
+    node-hosted copilot/gemini/opencode, so we inspect the foreground process's
+    real command line via the process tree. ``procs`` may be a shared snapshot to
+    avoid re-running ``ps`` per pane; one is captured on demand if omitted.
+    """
+    kind = classify_agent(pane.current_command)
+    if kind is None:
+        return None
+    if kind is AgentKind.CLAUDE and _is_runtime_command(pane.current_command):
+        if procs is None:
+            procs = capture_processes()
+        resolved = _classify_descendants(pane.pid, procs)
+        if resolved is not None:
+            return resolved
+    return kind
+
+
+def _classify_descendants(
+    root_pid: int, procs: ProcSnapshot
+) -> Optional[AgentKind]:
+    """Resolve the agent kind from ``root_pid``'s descendants: the first definite
+    non-claude agent wins; claude is only the answer if nothing else matched."""
+    fallback: Optional[AgentKind] = None
+    for command_line in procs.descendant_command_lines(root_pid):
+        kind = classify_command_line(command_line)
+        if kind is None:
+            continue
+        if kind is not AgentKind.CLAUDE:
+            return kind
+        fallback = AgentKind.CLAUDE
+    return fallback
 
 
 def list_panes() -> list[PaneInfo]:

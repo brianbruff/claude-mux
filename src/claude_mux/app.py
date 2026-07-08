@@ -18,18 +18,19 @@ from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
+from rich.console import Group
 from rich.text import Text
 from textual import work
 from textual.app import App, ComposeResult
 from textual.binding import Binding
-from textual.containers import Horizontal, Vertical
+from textual.containers import Horizontal, Vertical, VerticalScroll
 from textual.screen import ModalScreen
 from textual.theme import Theme
 from textual.widgets import Button, Footer, Header, Input, Label, Select, Static, Tree
 
 from claude_mux import activate, git, panemap, picker, treestate
 from claude_mux.config import Config, add_project, load_config, remove_project
-from claude_mux.model import Activity, Lifecycle, LiveClaude, Project, Worktree
+from claude_mux.model import Activity, AgentKind, Lifecycle, LiveAgent, Project, Worktree
 from claude_mux.status import StatusEngine
 from claude_mux import tmux
 
@@ -67,7 +68,7 @@ def format_idle(seconds: Optional[int]) -> Optional[str]:
     return f"idle {hours}h"
 
 
-def activity_text(live: Optional[LiveClaude]) -> str:
+def activity_text(live: Optional[LiveAgent]) -> str:
     """Short activity descriptor for a Live Claude (empty if none/unknown)."""
     if live is None:
         return ""
@@ -76,7 +77,7 @@ def activity_text(live: Optional[LiveClaude]) -> str:
     return _ACTIVITY_LABEL.get(live.activity, "")
 
 
-def scrape_extras(live: Optional[LiveClaude]) -> list[str]:
+def scrape_extras(live: Optional[LiveAgent]) -> list[str]:
     """Footer Scrape extras as display chips: model, context %, cost, elapsed."""
     if live is None:
         return []
@@ -93,10 +94,16 @@ def scrape_extras(live: Optional[LiveClaude]) -> list[str]:
 
 
 def worktree_summary(wt: Worktree) -> str:
-    """Best available 'what is this Claude doing' text for a worktree."""
+    """Best available 'what is this Claude doing' text for a worktree.
+
+    The ``latest_session`` fallback is the *claude* Session Index for the slug, so
+    it may only be shown when the primary agent is claude (or absent) — a
+    gemini/codex-only worktree must not display a stale claude conversation title.
+    """
     if wt.live is not None and wt.live.summary:
         return wt.live.summary
-    if wt.latest_session is not None and wt.latest_session.summary:
+    primary_is_claude = wt.live is None or wt.live.kind is AgentKind.CLAUDE
+    if primary_is_claude and wt.latest_session is not None and wt.latest_session.summary:
         return wt.latest_session.summary
     return ""
 
@@ -224,6 +231,16 @@ def worktree_rich_label(wt: Worktree) -> Text:
     if wt.is_primary:
         label.append(" *", style=_FAINT)
 
+    # Multiple agents in one worktree: collapse the single-agent tail into a
+    # compact count badge (the per-agent detail lives in the side panel). Guarded
+    # on LIVE so a stale agents list on a closed worktree can never show a badge.
+    if wt.lifecycle is Lifecycle.LIVE and len(wt.agents) > 1:
+        waiting = any(a.activity is Activity.WAITING for a in wt.agents)
+        running_any = any(a.activity is Activity.RUNNING for a in wt.agents)
+        badge_style = _AMBER if waiting else (_GREEN if running_any else _BLUE)
+        label.append(f"  {len(wt.agents)} agents", style=badge_style)
+        return label
+
     if running:
         label.append("  RUNNING", style=f"bold {_GREEN}")
     else:
@@ -255,6 +272,112 @@ def project_rich_label(project: Project) -> Text:
     label.append(project.name, style=f"bold {_MUTED}")
     label.append(f"  · {count} {suffix}", style=_FAINT)
     return label
+
+
+# --------------------------------------------------------------------------- #
+# Detail panel rendering (the side panel, one block per agent in a worktree)   #
+# --------------------------------------------------------------------------- #
+# Pure builders (no App, no I/O) so they unit-test as plain Rich renderables.
+
+# Per-kind glyph for the detail panel. claude keeps the solid dot family; the
+# others get distinct shapes so a mixed worktree reads at a glance.
+_AGENT_GLYPH = {
+    AgentKind.CLAUDE: "◆",
+    AgentKind.GEMINI: "✦",
+    AgentKind.CODEX: "◇",
+    AgentKind.COPILOT: "▲",
+    AgentKind.OPENCODE: "■",
+    AgentKind.UNKNOWN: "●",
+}
+
+
+def _agent_color(agent: LiveAgent) -> str:
+    """Activity-driven colour for one agent's marker (per-agent mirror of _marker_color)."""
+    if agent.activity is Activity.WAITING:
+        return _AMBER
+    if agent.activity is Activity.IDLE:
+        return _BLUE
+    if agent.activity is Activity.RUNNING:
+        return _GREEN
+    return _DIM  # UNKNOWN (e.g. a scrape-only non-claude agent)
+
+
+def agent_block(agent: LiveAgent) -> Text:
+    """One agent's detail block: glyph + KIND + activity, summary (claude), chips."""
+    block = Text(no_wrap=False)
+    glyph = _AGENT_GLYPH.get(agent.kind, "●")
+    block.append(f"{glyph} ", style=_agent_color(agent))
+    block.append(agent.kind.value, style=f"bold {_TEXT_BRIGHT}")
+
+    activity = activity_text(agent)
+    if activity:
+        waiting = agent.activity is Activity.WAITING
+        block.append(f"   {activity}", style=_AMBER if waiting else _MUTED)
+
+    if agent.summary:  # only claude carries a conversation summary
+        block.append(f"\n    {agent.summary}", style=_MUTED)
+
+    extras = scrape_extras(agent)
+    if extras:
+        block.append("\n    ")
+        for i, extra in enumerate(extras):
+            if i:
+                block.append(" · ", style=_SEP)
+            block.append(extra, style=_MUTED)
+    return block
+
+
+def worktree_detail(wt: Worktree) -> Group:
+    """Full detail renderable for a Worktree: header + path + one block per agent."""
+    header = Text(no_wrap=True)
+    header.append(f"{_LIFECYCLE_MARKER.get(wt.lifecycle, '?')} ", style=_marker_color(wt))
+    header.append(wt.branch or wt.path.name, style=f"bold {_TEXT_BRIGHT}")
+    if wt.is_primary:
+        header.append(" *", style=_FAINT)
+    header.append(f"   {wt.lifecycle.value}", style=_DIM)
+
+    path = Text(str(wt.path), style=_FAINT)
+
+    if not wt.agents:
+        hint = Text("No agent running — Enter to open, r to resume", style=_DIM)
+        return Group(header, path, Text(""), hint)
+
+    blocks: list = [header, path, Text("")]
+    if len(wt.agents) > 1:
+        blocks.append(Text(f"{len(wt.agents)} agents", style=_BLUE))
+        blocks.append(Text(""))
+    for agent in wt.agents:
+        blocks.append(agent_block(agent))
+        blocks.append(Text(""))
+    return Group(*blocks)
+
+
+def project_detail(project: Project) -> Text:
+    """Detail renderable for a Project node: counts + lifecycle + per-kind rollup."""
+    count = len(project.worktrees)
+    suffix = "worktree" if count == 1 else "worktrees"
+    text = Text(no_wrap=False)
+    text.append(project.name, style=f"bold {_TEXT_BRIGHT}")
+    text.append(f"   {count} {suffix}\n\n", style=_FAINT)
+
+    live = sum(1 for w in project.worktrees if w.lifecycle is Lifecycle.LIVE)
+    open_ = sum(1 for w in project.worktrees if w.lifecycle is Lifecycle.OPEN)
+    dormant = count - live - open_
+    text.append(f"● {live} live", style=_GREEN if live else _DIM)
+    text.append("   ")
+    text.append(f"◐ {open_} open", style=_BLUE if open_ else _DIM)
+    text.append("   ")
+    text.append(f"○ {dormant} dormant", style=_MUTED if dormant else _DIM)
+
+    kinds: dict[AgentKind, int] = {}
+    for w in project.worktrees:
+        for agent in w.agents:
+            kinds[agent.kind] = kinds.get(agent.kind, 0) + 1
+    if kinds:
+        text.append("\n\nagents: ", style=_DIM)
+        parts = " · ".join(f"{n} {k.value}" for k, n in kinds.items())
+        text.append(parts, style=_MUTED)
+    return text
 
 
 # --------------------------------------------------------------------------- #
@@ -447,14 +570,35 @@ class ClaudeMuxApp(App):
         color: $foreground;
     }
 
+    /* Body: the tree (left) beside the agent detail panel (right). */
+    #body {
+        height: 1fr;
+    }
+
     /* The Project -> Worktree tree: quiet surface, hairline guides, and a
        green-tinted active row (the design's left-accent selection). */
     Tree {
+        width: 60%;
         padding: 0 1;
         background: $surface;
         color: $foreground;
         scrollbar-background: $surface;
         scrollbar-color: #2a2e31;
+    }
+
+    /* Agent detail panel: a quieter surface than the tree, hairline divider,
+       scrolls independently for worktrees hosting many agents. */
+    #detail {
+        width: 40%;
+        padding: 0 1;
+        background: $panel;
+        color: $foreground;
+        border-left: solid #2a2e31;
+        scrollbar-background: $panel;
+        scrollbar-color: #2a2e31;
+    }
+    #detail-body {
+        height: auto;
     }
     Tree > .tree--cursor {
         background: $primary 20%;
@@ -578,12 +722,19 @@ class ClaudeMuxApp(App):
         # NB: not ``self.tree`` — Textual's App defines a read-only ``tree``
         # property (the DOM debug tree), so we hold the widget under ``_tree``.
         self._tree: Tree | None = None
+        # Last renderable pushed to the detail panel (testability hook).
+        self._detail_renderable = None
 
     # -- composition -------------------------------------------------------- #
 
     def compose(self) -> ComposeResult:
         yield Header()
-        yield Tree("Projects", id="tree")
+        # Tree on the left, agent detail panel on the right. The panel lists every
+        # agent in the selected worktree (or a project rollup) and scrolls on its own.
+        with Horizontal(id="body"):
+            yield Tree("Projects", id="tree")
+            with VerticalScroll(id="detail"):
+                yield Static(id="detail-body")
         # Quiet status line: live running count, current selection, host + clock,
         # and the back-to-menu hint (a tmux binding that works from the claude
         # pane, so it belongs here rather than in the Textual footer).
@@ -598,8 +749,17 @@ class ClaudeMuxApp(App):
         self._tree = self.query_one(Tree)
         self._tree.root.set_label(Text.assemble(("◈ ", _GREEN), ("Projects", f"bold {_MUTED}")))
         self._tree.root.expand()
+        # Keep the tree the focused widget (its cursor row highlights and drives
+        # NodeHighlighted); stop the scroll panel from grabbing Tab focus. vim
+        # nav is unaffected regardless — those bindings act on self._tree directly.
+        self._tree.focus()
+        try:
+            self.query_one("#detail", VerticalScroll).can_focus = False
+        except Exception:
+            pass
         self.sub_title = "popup" if self.popup else "dashboard"
         self._refresh_statusline()
+        self._refresh_detail()
         # First paint immediately, then hybrid refresh: slow safety poll + a
         # fast Events File watcher for near-instant `waiting` transitions.
         self._trigger_refresh()
@@ -688,6 +848,7 @@ class ClaudeMuxApp(App):
                     restore = wnode
 
         self._refresh_statusline()
+        self._refresh_detail()
 
         if restore is not None:
             # Defer the cursor restore: freshly-added nodes have no computed
@@ -699,6 +860,10 @@ class ClaudeMuxApp(App):
                     tree.move_cursor(node)
                 except Exception:
                     pass
+                # Reflect the restored selection in the panel (move_cursor's
+                # NodeHighlighted also fires this, but be explicit for the case
+                # where the cursor was already on the target line).
+                self._refresh_detail()
 
             self.call_after_refresh(_restore)
 
@@ -749,9 +914,36 @@ class ClaudeMuxApp(App):
         except Exception:
             pass  # status line is decorative; never let it disrupt the UI
 
+    # -- detail panel ------------------------------------------------------- #
+
+    def _refresh_detail(self) -> None:
+        """Repaint the side panel from the current cursor selection.
+
+        A Worktree row shows every agent (worktree_detail); a Project node shows a
+        rollup (project_detail); anything else shows a placeholder. Decorative, so
+        any failure is swallowed rather than allowed to disrupt the UI.
+        """
+        try:
+            body = self.query_one("#detail-body", Static)
+        except Exception:
+            return
+        node = self._tree.cursor_node if self._tree is not None else None
+        data = node.data if node is not None else None
+        if isinstance(data, Worktree):
+            renderable = worktree_detail(data)
+        elif isinstance(data, Project):
+            renderable = project_detail(data)
+        else:
+            renderable = Text("Select a worktree", style=_DIM)
+        # Stash the raw renderable (the Static wraps it internally, which is awkward
+        # to read back) so it is directly inspectable in tests.
+        self._detail_renderable = renderable
+        body.update(renderable)
+
     def on_tree_node_highlighted(self, event: Tree.NodeHighlighted) -> None:
-        # Keep the "current selection" segment in step with cursor movement.
+        # Keep the "current selection" segment and detail panel in step with the cursor.
         self._refresh_statusline()
+        self._refresh_detail()
 
     # -- selection helpers -------------------------------------------------- #
 

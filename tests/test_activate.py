@@ -269,6 +269,16 @@ def test_new_worktree_creates_then_activates(wired):
 
 def test_close_workspace_never_touches_git(wired):
     wt = _worktree(lifecycle=Lifecycle.LIVE)
+    # Populate live + agents so we can prove close clears BOTH (else a closed
+    # DORMANT worktree keeps a stale agents list -> ghost "N agents" badge).
+    from claude_mux.model import AgentKind, LiveAgent
+
+    agent = LiveAgent(
+        pane_id="%1", session_name="proj", window_index=0, pid=1,
+        cwd=wt.path, kind=AgentKind.CLAUDE,
+    )
+    wt.live = agent
+    wt.agents = [agent]
     activate_mod.close_workspace(wt)
 
     assert wired.git_calls == []  # git untouched
@@ -278,6 +288,7 @@ def test_close_workspace_never_touches_git(wired):
     assert ("kill_window", MUX, name) in wired.log
     assert wt.lifecycle is Lifecycle.DORMANT
     assert wt.live is None
+    assert wt.agents == []
 
 
 def test_close_workspace_swallows_tmux_errors(wired, monkeypatch):
