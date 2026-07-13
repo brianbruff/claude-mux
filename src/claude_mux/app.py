@@ -26,7 +26,7 @@ from textual.binding import Binding
 from textual.containers import Horizontal, Vertical, VerticalScroll
 from textual.screen import ModalScreen
 from textual.theme import Theme
-from textual.widgets import Button, Footer, Header, Input, Label, Select, Static, Tree
+from textual.widgets import Button, Header, Input, Label, Select, Static, Tree
 
 from claude_mux import activate, git, panemap, picker, treestate
 from claude_mux.config import Config, add_project, load_config, remove_project
@@ -181,8 +181,6 @@ CLAUDE_MUX_THEME = Theme(
     panel="#1b1d1f",
     dark=True,
     variables={
-        "footer-key-foreground": _GREEN,
-        "footer-description-foreground": "#8b9298",
         "block-cursor-foreground": "#ffffff",
         "block-cursor-background": "#3C8321",
         "input-selection-background": "#3C8321 45%",
@@ -626,24 +624,6 @@ class ClaudeMuxApp(App):
         color: $foreground;
     }
 
-    /* Footer: muted descriptions with green key-caps (the one accent). */
-    Footer {
-        background: $surface;
-        color: $foreground;
-    }
-    FooterKey {
-        background: $surface;
-    }
-    FooterKey > .footer-key--key {
-        color: $accent;
-        background: $surface;
-        text-style: bold;
-    }
-    FooterKey > .footer-key--description {
-        color: #8b9298;
-        background: $surface;
-    }
-
     /* Green focus ring on the active input, per the modal spec (1d). */
     Input:focus {
         border: tall $accent;
@@ -739,7 +719,6 @@ class ClaudeMuxApp(App):
         # and the back-to-menu hint (a tmux binding that works from the claude
         # pane, so it belongs here rather than in the Textual footer).
         yield Static(id="statusline")
-        yield Footer()
 
     def on_mount(self) -> None:
         # Enverus-green dark theme drives every stock widget (header, footer,
