@@ -519,6 +519,15 @@ class ConfirmScreen(ModalScreen[bool]):
     ConfirmScreen Button {
         margin-left: 2;
     }
+    /* Tab/Shift+Tab cycle between No and Yes (Screen's built-in focus chain);
+       recolour the focused button's top/bottom rule to the bright accent so the
+       cursor is obvious. Only the top/bottom border is touched (it is already
+       ``tall`` by default) so focus never shifts the button's size. */
+    ConfirmScreen Button:focus {
+        border-top: tall $accent;
+        border-bottom: tall $accent;
+        text-style: bold;
+    }
     """
 
     BINDINGS = [
@@ -880,6 +889,12 @@ class ClaudeMuxApp(App):
         text.append("  ·  ", style=_SEP)
         text.append("prefix + m", style=_TEXT)
         text.append(" returns here", style=_DIM)
+
+        # Always advertise the command palette near the right end of the bar; it
+        # is the discoverability entry point for every action beyond the footer.
+        text.append("  ·  ", style=_SEP)
+        text.append("ctrl+p", style=_TEXT)
+        text.append(" palette", style=_DIM)
 
         text.append("  ·  ", style=_SEP)
         text.append(self._host, style=_MUTED)
