@@ -644,6 +644,7 @@ class ClaudeMuxApp(App):
         Binding("n", "new", "New worktree"),
         Binding("r", "resume", "Resume"),
         Binding("x", "close", "Close workspace"),
+        Binding("D", "delete_worktree", "Delete worktree"),
         Binding("a", "add_project", "Add project"),
         Binding("d", "remove_project", "Remove project"),
         Binding("g", "refresh", "Refresh"),
@@ -1183,6 +1184,38 @@ class ClaudeMuxApp(App):
             on_confirm,
         )
 
+    def action_delete_worktree(self) -> None:
+        # Destructive counterpart to `x` (close): removes the git worktree from
+        # disk, not just its tmux window. Bound to shift+D — a capital, plus the
+        # confirm below — so it can't be a single accidental tap next to `d`
+        # (remove project) or `x` (close).
+        wt = self._current_worktree()
+        if wt is None:
+            self.notify("Select a worktree to delete", severity="warning")
+            return
+        if wt.is_primary:
+            # The primary working tree is the repo checkout itself; git refuses to
+            # remove it anyway, so reject early with a clearer message.
+            self.notify("Cannot delete the primary worktree", severity="warning")
+            return
+        project = self._project_for(wt)
+        if project is None:
+            self.notify("Could not resolve the worktree's project", severity="error")
+            return
+
+        def on_confirm(ok: bool) -> None:
+            if ok:
+                self._do_delete_worktree(wt, project.root)
+
+        self.push_screen(
+            ConfirmScreen(
+                f"Delete git worktree for '{wt.branch or wt.path.name}'? "
+                "This removes the directory from disk"
+                + (f" and deletes branch '{wt.branch}'." if wt.branch else ".")
+            ),
+            on_confirm,
+        )
+
     # -- project management (edits config.toml only; never the filesystem) -- #
 
     def _default_pick_start(self) -> Path:
@@ -1329,6 +1362,23 @@ class ClaudeMuxApp(App):
         except Exception as exc:
             self.call_from_thread(self.notify, f"close failed: {exc}", severity="error")
             return
+        self.call_from_thread(self._trigger_refresh)
+
+    @work(thread=True, group="lifecycle")
+    def _do_delete_worktree(self, wt: Worktree, project_root: Path) -> None:
+        # Same lock as open/close/create: the destructive git teardown must not
+        # interleave with an in-flight open/close of the same Worktree.
+        try:
+            with self._lifecycle_lock:
+                activate.remove_worktree(wt, project_root)
+        except Exception as exc:
+            self.call_from_thread(
+                self.notify, f"delete worktree failed: {exc}", severity="error"
+            )
+            return
+        self.call_from_thread(
+            self.notify, f"Deleted worktree: {wt.branch or wt.path.name}"
+        )
         self.call_from_thread(self._trigger_refresh)
 
     @work(thread=True, group="editor")

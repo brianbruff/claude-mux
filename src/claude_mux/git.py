@@ -136,6 +136,28 @@ def add_worktree(project_root: Path, branch: str, pattern: str, base: str) -> Pa
     return target
 
 
-def remove_worktree(path: Path) -> None:
-    """Remove a git worktree (git worktree remove). Destructive."""
-    _run_git(path, "worktree", "remove", str(path))
+def remove_worktree(project_root: Path, path: Path) -> None:
+    """Remove a git worktree, tolerating an already-deleted directory. Destructive.
+
+    Runs from ``project_root`` — never from ``path``, which may already be gone if
+    the operator deleted the folder by hand (subprocess cannot ``cwd`` into a
+    missing directory). ``--force`` covers a worktree whose directory is missing
+    or whose state is dirty/locked. If git still refuses (a dangling half-removed
+    entry), fall back to ``git worktree prune`` to clear the stale registration so
+    it stops appearing in ``git worktree list``.
+    """
+    try:
+        _run_git(project_root, "worktree", "remove", "--force", str(path))
+    except subprocess.CalledProcessError:
+        _run_git(project_root, "worktree", "prune")
+
+
+def delete_branch(project_root: Path, branch: str) -> None:
+    """Force-delete a local branch (``git branch -D``). Destructive.
+
+    Force (``-D``, not ``-d``) so a feature branch that was never merged is still
+    removed — deleting the worktree is the operator's signal that the branch is
+    done with. Must run AFTER the worktree is removed: git refuses to delete a
+    branch that is still checked out in a worktree.
+    """
+    _run_git(project_root, "branch", "-D", branch)

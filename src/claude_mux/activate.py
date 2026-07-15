@@ -12,11 +12,13 @@ Layering:
   * ``new_worktree`` = create the git worktree, then open its Workspace.
   * ``close_workspace`` tears down only the tmux window (Live/Open -> Dormant); it
     NEVER touches git. The menu window (window 0) always survives.
-  * ``remove_worktree`` is the distinct, destructive git teardown; callers confirm.
+  * ``remove_worktree`` is the distinct, destructive git teardown — removes the
+    worktree AND deletes its branch; callers confirm.
 """
 from __future__ import annotations
 
 import hashlib
+from pathlib import Path
 from typing import Optional
 
 from claude_mux import git, layouts, sessions, tmux
@@ -174,11 +176,20 @@ def close_workspace(worktree: Worktree) -> None:
     worktree.lifecycle = Lifecycle.DORMANT
 
 
-def remove_worktree(worktree: Worktree) -> None:
-    """Remove the git worktree; destructive, caller must confirm.
+def remove_worktree(worktree: Worktree, project_root: Path) -> None:
+    """Remove the git worktree AND its branch; destructive, caller must confirm.
 
-    Only runs when explicitly called. Close the Workspace first so no window lingers
-    pointing at a directory git is about to remove, then ``git worktree remove``.
+    Only runs when explicitly called. Steps, in order:
+      1. Close the Workspace so no window lingers pointing at a directory git is
+         about to remove.
+      2. ``git worktree remove`` (run from ``project_root``, which survives even
+         when the worktree directory has already been deleted by hand).
+      3. ``git branch -D`` the worktree's branch — a worktree and its feature
+         branch are one unit, so deleting the worktree retires the branch too.
+         Skipped for a detached worktree (no branch) and for the branch the
+         primary tree has checked out (callers already reject the primary).
     """
     close_workspace(worktree)
-    git.remove_worktree(worktree.path)
+    git.remove_worktree(project_root, worktree.path)
+    if worktree.branch:
+        git.delete_branch(project_root, worktree.branch)

@@ -75,8 +75,11 @@ class Recorder:
         self.git_calls.append(("add_worktree", project_root, branch, pattern, base))
         return project_root.parent / f"{project_root.name}.worktrees" / branch.replace("/", "_")
 
-    def remove_worktree(self, path):
-        self.git_calls.append(("remove_worktree", path))
+    def remove_worktree(self, project_root, path):
+        self.git_calls.append(("remove_worktree", project_root, path))
+
+    def delete_branch(self, project_root, branch):
+        self.git_calls.append(("delete_branch", project_root, branch))
 
     # sessions surface ---------------------------------------------
     def encode_slug(self, path):
@@ -101,7 +104,7 @@ def wired(monkeypatch):
         "kill_window",
     ):
         monkeypatch.setattr(activate_mod.tmux, name, getattr(rec, name))
-    for name in ("sanitize_branch", "add_worktree", "remove_worktree"):
+    for name in ("sanitize_branch", "add_worktree", "remove_worktree", "delete_branch"):
         monkeypatch.setattr(activate_mod.git, name, getattr(rec, name))
     monkeypatch.setattr(activate_mod.sessions, "encode_slug", rec.encode_slug)
     return rec
@@ -303,6 +306,23 @@ def test_close_workspace_swallows_tmux_errors(wired, monkeypatch):
 
 def test_remove_worktree_calls_git(wired):
     wt = _worktree(lifecycle=Lifecycle.LIVE)
-    activate_mod.remove_worktree(wt)
-    assert ("remove_worktree", wt.path) in wired.git_calls
+    project_root = Path("/repo")
+    activate_mod.remove_worktree(wt, project_root)
+    assert ("remove_worktree", project_root, wt.path) in wired.git_calls
+    # The branch is retired together with the worktree, and only AFTER the
+    # worktree is removed (git refuses to delete a checked-out branch).
+    assert ("delete_branch", project_root, wt.branch) in wired.git_calls
+    remove_idx = wired.git_calls.index(("remove_worktree", project_root, wt.path))
+    delete_idx = wired.git_calls.index(("delete_branch", project_root, wt.branch))
+    assert remove_idx < delete_idx
     assert wt.lifecycle is Lifecycle.DORMANT
+
+
+def test_remove_worktree_detached_skips_branch_delete(wired):
+    # A detached worktree has no branch, so there is nothing to delete — the
+    # worktree is removed but no ``git branch -D`` is attempted.
+    wt = _worktree(branch="", lifecycle=Lifecycle.DORMANT)
+    project_root = Path("/repo")
+    activate_mod.remove_worktree(wt, project_root)
+    assert ("remove_worktree", project_root, wt.path) in wired.git_calls
+    assert not any(call[0] == "delete_branch" for call in wired.git_calls)
