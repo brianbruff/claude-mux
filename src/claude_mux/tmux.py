@@ -819,3 +819,22 @@ def kill_window(session_name: str, window_target: str) -> None:
     except Exception:
         # Window may already be gone; killing is idempotent from the caller's view.
         pass
+
+
+def kill_session(session_name: str = MUX_SESSION) -> None:
+    """Kill the whole owned tmux session (every Workspace window with it).
+
+    The teardown for quitting claude-mux: one ``kill-session`` drops the menu and
+    all open Workspaces, and — when the operator is attached inside it — detaches
+    every client so the terminal returns to wherever tmux was launched from.
+    Scoped to the named session, so the operator's other sessions are untouched.
+    Idempotent and best-effort: a missing session or dead server is a no-op.
+    """
+    server = _server()
+    if not server.is_alive():
+        return
+    try:
+        server.cmd("kill-session", "-t", session_name)
+    except Exception:
+        # Session may already be gone; killing is idempotent from the caller's view.
+        pass

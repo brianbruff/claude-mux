@@ -719,6 +719,11 @@ class ClaudeMuxApp(App):
         self._tree: Tree | None = None
         # Last renderable pushed to the detail panel (testability hook).
         self._detail_renderable = None
+        # Set by action_quit (persistent menu only, not popup) to tell
+        # run_dashboard to kill the owned tmux session once the Textual app has
+        # exited and restored the terminal. Not done inside the action because we
+        # ARE window 0's process — killing the session there SIGHUPs us mid-exit.
+        self._quit_kills_session = False
 
     # -- composition -------------------------------------------------------- #
 
@@ -795,6 +800,20 @@ class ClaudeMuxApp(App):
 
     def action_refresh(self) -> None:
         self._trigger_refresh()
+
+    async def action_quit(self) -> None:
+        """``q`` (and the ctrl+p Quit command): leave claude-mux.
+
+        In the persistent menu this tears the whole owned tmux session down —
+        the menu plus every open Workspace — so quitting the dashboard really
+        does close claude-mux rather than leaving orphaned Workspace windows
+        behind. The kill itself is deferred to run_dashboard (see the flag) so
+        it runs after the terminal is restored. In popup mode ``q`` is just an
+        overlay close, so the session is left running.
+        """
+        if not self.popup:
+            self._quit_kills_session = True
+        self.exit()
 
     # -- tree rendering ----------------------------------------------------- #
 
@@ -1425,3 +1444,9 @@ def run_dashboard(config: Config | None = None, popup: bool = False) -> None:
         config = load_config()
     app = ClaudeMuxApp(config, popup=popup)
     app.run()
+    # Quitting the persistent menu tears the owned session down (menu + every
+    # open Workspace). Deferred to here — after app.run() has restored the
+    # terminal — so the kill-session that ends our own window can't SIGHUP the
+    # app mid-exit. A popup never sets the flag.
+    if app._quit_kills_session:
+        tmux.kill_session()
