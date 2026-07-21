@@ -428,7 +428,7 @@ class BranchPromptScreen(ModalScreen[Optional[tuple[str, str]]]):
 
     def compose(self) -> ComposeResult:
         with Vertical(id="dialog"):
-            yield Label("New worktree branch name:")
+            yield Label("New branch name:")
             yield Input(placeholder="feature/my-branch", id="branch")
             yield Label("Base branch:", id="base-label")
             yield Select(
@@ -482,7 +482,7 @@ class PathPromptScreen(ModalScreen[Optional[str]]):
 
     def compose(self) -> ComposeResult:
         with Vertical(id="dialog"):
-            yield Label("Project directory (git repo root):")
+            yield Label("Repo directory (git repo root):")
             yield Input(placeholder="~/path/to/repo", id="path")
 
     def on_mount(self) -> None:
@@ -639,35 +639,40 @@ class ClaudeMuxApp(App):
     }
     """
 
+    # One consistent vocabulary in the keys panel: repos (the tracked git repos)
+    # and branches (their worktrees — "worktree" stays the internal domain term
+    # but never surfaces to the operator). Two teardown verbs per branch: `x`
+    # close (session only, git untouched) and `D` delete (removes it from cmux
+    # and deletes the worktree + branch — destructive, confirmed).
     BINDINGS = [
-        Binding("enter", "jump", "Enter workspace"),
-        Binding("n", "new", "New worktree"),
+        Binding("enter", "jump", "Enter branch"),
+        Binding("n", "new", "Add branch"),
         Binding("r", "resume", "Resume"),
-        Binding("x", "close", "Close workspace"),
-        Binding("D", "delete_worktree", "Delete worktree"),
-        Binding("a", "add_project", "Add project"),
-        Binding("d", "remove_project", "Remove project"),
+        Binding("o", "open_editor", "Open in editor"),
+        Binding("x", "close", "Close branch"),
+        Binding("D", "delete_worktree", "Delete branch"),
+        Binding("a", "add_project", "Add repo"),
+        Binding("d", "remove_project", "Remove repo"),
         Binding("g", "refresh", "Refresh"),
         Binding("q", "quit", "Quit"),
-        # vim-style LEVEL navigation. The tree has two levels — Projects and
-        # their Worktrees — and hjkl move within/between them rather than over
-        # every visible row:
-        #   * j/k step to the next/previous SIBLING at the current level (project
-        #     -> project, or worktree -> worktree of the same project).
-        #   * l steps IN: on a Project, into its first Worktree; on a Worktree it
-        #     resumes that Worktree's session (same as Enter).
-        #   * h steps OUT: from a Worktree back to its Project (and collapses a
-        #     Project already at the top level).
-        #   * o opens the selected Worktree in the configured editor (VS Code).
-        # j/k are kept off the footer to avoid clutter. Single letters are safe
-        # next to the modal Inputs: an Input consumes printable keys itself, so
-        # these never fire while a BranchPrompt/PathPrompt is focused (same as
-        # the existing n/r/x/a/d bindings).
-        Binding("j", "cursor_down", "Down", show=False),
-        Binding("k", "cursor_up", "Up", show=False),
-        Binding("l", "step_in", "In / resume"),
-        Binding("h", "step_out", "Out"),
-        Binding("o", "open_editor", "Open in editor"),
+        # vim-style LEVEL navigation. The tree has two levels — repos and their
+        # branches — and hjkl move within/between them rather than over every
+        # visible row:
+        #   * j/k step to the next/previous SIBLING at the current level (repo ->
+        #     repo, or branch -> branch of the same repo).
+        #   * l steps IN: on a repo, into its first branch; on a branch it resumes
+        #     that branch's session (same as Enter).
+        #   * h steps OUT: from a branch back to its repo (and collapses a repo
+        #     already at the top level).
+        # These are hidden from the ctrl+p keys panel (system=True) — hjkl are
+        # obvious to vim users and only clutter the list. They still work; the
+        # keys panel filters on Binding.system, not Binding.show. Single letters
+        # are safe next to the modal Inputs: an Input consumes printable keys
+        # itself, so these never fire while a BranchPrompt/PathPrompt is focused.
+        Binding("j", "cursor_down", "Down", system=True),
+        Binding("k", "cursor_up", "Up", system=True),
+        Binding("l", "step_in", "In / resume", system=True),
+        Binding("h", "step_out", "Out", system=True),
     ]
 
     def __init__(self, config: Config, popup: bool = False):
@@ -1123,7 +1128,7 @@ class ClaudeMuxApp(App):
         """``o``: open the selected Worktree in the configured editor."""
         wt = self._current_worktree()
         if wt is None:
-            self.notify("Select a worktree to open in the editor", severity="warning")
+            self.notify("Select a branch to open in the editor", severity="warning")
             return
         self._do_open_editor(wt)
 
@@ -1150,7 +1155,7 @@ class ClaudeMuxApp(App):
     def action_new(self) -> None:
         project = self._current_project()
         if project is None:
-            self.notify("Select a project or worktree first", severity="warning")
+            self.notify("Select a repo or branch first", severity="warning")
             return
 
         try:
@@ -1172,7 +1177,7 @@ class ClaudeMuxApp(App):
         if wt is None:
             return
         if wt.lifecycle is Lifecycle.DORMANT:
-            self.notify("No workspace to close", severity="warning")
+            self.notify("No session to close", severity="warning")
             return
 
         def on_confirm(ok: bool) -> None:
@@ -1180,27 +1185,29 @@ class ClaudeMuxApp(App):
                 self._do_close(wt)
 
         self.push_screen(
-            ConfirmScreen(f"Close the workspace for '{wt.branch}'? (git untouched)"),
+            ConfirmScreen(
+                f"Close branch '{wt.branch}'? (session only; git untouched)"
+            ),
             on_confirm,
         )
 
     def action_delete_worktree(self) -> None:
-        # Destructive counterpart to `x` (close): removes the git worktree from
-        # disk, not just its tmux window. Bound to shift+D — a capital, plus the
-        # confirm below — so it can't be a single accidental tap next to `d`
-        # (remove project) or `x` (close).
+        # Destructive counterpart to `x` (close): removes the branch from cmux by
+        # deleting its worktree from disk, not just its tmux window. Bound to
+        # shift+D — a capital, plus the confirm below — so it can't be a single
+        # accidental tap next to `d` (remove repo) or `x` (close).
         wt = self._current_worktree()
         if wt is None:
-            self.notify("Select a worktree to delete", severity="warning")
+            self.notify("Select a branch to delete", severity="warning")
             return
         if wt.is_primary:
             # The primary working tree is the repo checkout itself; git refuses to
             # remove it anyway, so reject early with a clearer message.
-            self.notify("Cannot delete the primary worktree", severity="warning")
+            self.notify("Cannot delete the primary branch", severity="warning")
             return
         project = self._project_for(wt)
         if project is None:
-            self.notify("Could not resolve the worktree's project", severity="error")
+            self.notify("Could not resolve the branch's repo", severity="error")
             return
 
         def on_confirm(ok: bool) -> None:
@@ -1209,8 +1216,8 @@ class ClaudeMuxApp(App):
 
         self.push_screen(
             ConfirmScreen(
-                f"Delete git worktree for '{wt.branch or wt.path.name}'? "
-                "This removes the directory from disk"
+                f"Delete branch '{wt.branch or wt.path.name}'? "
+                "This removes its worktree directory from disk"
                 + (f" and deletes branch '{wt.branch}'." if wt.branch else ".")
             ),
             on_confirm,
@@ -1253,7 +1260,7 @@ class ClaudeMuxApp(App):
                 added, message = add_project(path)
             except Exception as exc:
                 self.call_from_thread(
-                    self.notify, f"add project failed: {exc}", severity="error"
+                    self.notify, f"add repo failed: {exc}", severity="error"
                 )
                 return
             self.call_from_thread(
@@ -1265,7 +1272,7 @@ class ClaudeMuxApp(App):
     def action_remove_project(self) -> None:
         project = self._current_project()
         if project is None:
-            self.notify("Select a project to remove", severity="warning")
+            self.notify("Select a repo to remove", severity="warning")
             return
 
         def on_confirm(ok: bool) -> None:
@@ -1274,7 +1281,7 @@ class ClaudeMuxApp(App):
 
         self.push_screen(
             ConfirmScreen(
-                f"Remove project '{project.name}' from claude-mux? "
+                f"Remove repo '{project.name}' from claude-mux? "
                 "(the folder is NOT deleted)"
             ),
             on_confirm,
@@ -1291,16 +1298,16 @@ class ClaudeMuxApp(App):
                 removed = remove_project(project.root)
             except Exception as exc:
                 self.call_from_thread(
-                    self.notify, f"remove project failed: {exc}", severity="error"
+                    self.notify, f"remove repo failed: {exc}", severity="error"
                 )
                 return
             if removed:
-                self.call_from_thread(self.notify, f"Removed project: {project.name}")
+                self.call_from_thread(self.notify, f"Removed repo: {project.name}")
                 self._reload_config()
             else:
                 self.call_from_thread(
                     self.notify,
-                    f"Project not found in config: {project.name}",
+                    f"Repo not found in config: {project.name}",
                     severity="warning",
                 )
 
@@ -1347,7 +1354,7 @@ class ClaudeMuxApp(App):
                 activate.new_worktree(project, branch, self.config, base=base)
         except Exception as exc:
             self.call_from_thread(
-                self.notify, f"new worktree failed: {exc}", severity="error"
+                self.notify, f"add branch failed: {exc}", severity="error"
             )
             return
         self._after_navigation()
@@ -1373,11 +1380,11 @@ class ClaudeMuxApp(App):
                 activate.remove_worktree(wt, project_root)
         except Exception as exc:
             self.call_from_thread(
-                self.notify, f"delete worktree failed: {exc}", severity="error"
+                self.notify, f"delete branch failed: {exc}", severity="error"
             )
             return
         self.call_from_thread(
-            self.notify, f"Deleted worktree: {wt.branch or wt.path.name}"
+            self.notify, f"Deleted branch: {wt.branch or wt.path.name}"
         )
         self.call_from_thread(self._trigger_refresh)
 

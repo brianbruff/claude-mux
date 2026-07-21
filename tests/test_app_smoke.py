@@ -11,7 +11,7 @@ import asyncio
 
 from rich.console import Console
 from textual.containers import VerticalScroll
-from textual.widgets import Footer, Header, Static, Tree
+from textual.widgets import Header, Static, Tree
 
 from claude_mux.app import ClaudeMuxApp
 from claude_mux.config import Config
@@ -37,9 +37,10 @@ def test_app_composes_with_no_projects() -> None:
             # Let on_mount + the first background refresh worker settle.
             await pilot.pause()
 
-            # Core chrome composed.
+            # Core chrome composed. (The Footer was retired — key hints now live
+            # in the ctrl+p keys panel, so only Header + tree + statusline remain.)
             assert app.query_one(Header) is not None
-            assert app.query_one(Footer) is not None
+            assert app.query_one("#statusline", Static) is not None
 
             tree = app.query_one(Tree)
             assert tree is app._tree
