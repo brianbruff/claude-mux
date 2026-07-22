@@ -8,7 +8,7 @@ def test_classic_structure_and_command_injection():
     plan = layouts.build_plan("classic", "claude --resume x")
     assert plan.name == "classic"
     roles = [p.role for p in plan.panes]
-    assert roles == ["claude", "yazi", "shell"]
+    assert roles == ["claude", "yazi", "shell", "codex"]
 
     by_role = {p.role: p for p in plan.panes}
     # claude is the initial pane (no split) and carries the injected command.
@@ -18,6 +18,9 @@ def test_classic_structure_and_command_injection():
     assert (by_role["yazi"].frm, by_role["yazi"].direction) == ("claude", "right")
     assert (by_role["shell"].frm, by_role["shell"].direction) == ("yazi", "below")
     assert by_role["shell"].command is None
+    # codex splits below claude, making the left column claude-over-codex.
+    assert (by_role["codex"].frm, by_role["codex"].direction) == ("claude", "below")
+    assert by_role["codex"].command == "codex"
 
 
 def test_dev_layout_has_lazygit_and_40pct_claude():

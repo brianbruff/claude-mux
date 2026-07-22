@@ -14,7 +14,7 @@ unit-testable. Clean launching (execing the program so terminal-query bytes neve
 leak into a shell prompt) is the executor's job.
 
 Built-in layouts:
-  * ``classic`` — claude left (50%), yazi top-right, a plain shell bottom-right.
+  * ``classic`` — claude top-left, codex bottom-left, yazi top-right, shell bottom-right.
   * ``dev``     — claude left (40%), yazi top-right, and a bottom-right row split
                   into a plain terminal and ``lazygit``.
 
@@ -55,13 +55,14 @@ class LayoutPlan:
 
 
 def _classic(claude_cmd: str) -> LayoutPlan:
-    """claude left (50%), yazi top-right, plain shell bottom-right."""
+    """claude top-left, codex bottom-left, yazi top-right, shell bottom-right."""
     return LayoutPlan(
         name="classic",
         panes=(
             PaneSpec("claude", claude_cmd or None),
             PaneSpec("yazi", "yazi", frm="claude", direction="right", percentage=50),
             PaneSpec("shell", None, frm="yazi", direction="below", percentage=50),
+            PaneSpec("codex", "codex", frm="claude", direction="below", percentage=50),
         ),
     )
 

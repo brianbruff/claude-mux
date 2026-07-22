@@ -49,8 +49,8 @@ Make the tree actionable for navigation.
 Take a **Dormant** Worktree (on disk, no window — e.g. created by plain `git worktree add`, or a closed Workspace) to **Live**.
 
 - Create the Project's tmux session if absent; add a window (via `libtmux`).
-- Build the layout: `claude` left vertical split, `yazi` top-right, shell bottom-right.
-- Launch claude in the left pane: `--resume <sessionId>` of the worktree's most recent Session (from its Project Slug's Session Index) if one exists, else fresh.
+- Build the layout: `claude`/George top-left, `codex` bottom-left, `yazi` top-right, shell bottom-right.
+- Launch claude in the first/top-left pane: `--resume <sessionId>` of the worktree's most recent Session (from its Project Slug's Session Index) if one exists, else fresh.
 - Jump to it (reuses M3).
 
 **Demo:** select any Dormant worktree in the tree → one keystroke → ready-to-work, Live, focused. Reactivating a worktree that had prior work resumes that conversation.
@@ -107,10 +107,10 @@ projects = [                              # the only required setting
 [defaults]
 worktree_pattern = "{repo}.worktrees/{branch}"   # {branch} sanitized: / -> _
 base_branch      = "HEAD"                          # new worktrees branch off this
-claude_cmd       = "claude"                         # command run in the left pane
+claude_cmd       = "claude"                         # command run in the first/top-left pane
 ```
 
-Layout (claude-left / yazi-TR / shell-BR, split ratios), keybindings, and model flag are **hardcoded** in v1 — promoted to config only when actually needed.
+Layout (claude/George-TL / codex-BL / yazi-TR / shell-BR, split ratios), keybindings, and model flag are **hardcoded** in v1 — promoted to config only when actually needed.
 
 `config.py` is **read-write** as of M7: the file is hand-editable and also rewritten in place when Projects are added or removed from the TUI (projects list + `[defaults]` table, atomic write). Only `config.toml` is ever touched.
 

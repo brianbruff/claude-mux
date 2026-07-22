@@ -109,6 +109,16 @@ def _pane_count(sock: str, window_target: str) -> int:
     return len([p for p in out.splitlines() if p])
 
 
+def _prefix_binding(sock: str, key: str) -> str:
+    out = _q(sock, "list-keys", "-T", "prefix")
+    for line in out.splitlines():
+        parts = line.split(maxsplit=4)
+        if len(parts) >= 4 and parts[:4] == ["bind-key", "-T", "prefix", key]:
+            return line
+    return ""
+
+
+
 def test_bootstrap_adds_terminal_beside_menu(mux):
     sock, session = mux
     tmux.bootstrap(menu_cmd=INERT, attach=False)
@@ -141,6 +151,7 @@ def test_open_or_select_creates_and_selects_workspace(mux):
     assert tmux.find_window(session, name) == target
     # The claude (left column) pane is the active pane.
     assert _q(sock, "display-message", "-p", "-t", session, "#{pane_left}") == "0"
+    assert _pane_count(sock, target) == 4
 
 
 def test_second_open_selects_existing_no_duplicate(mux):
@@ -171,7 +182,7 @@ def test_menu_keybinding_registered_and_works(mux):
     # The binding is registered under the prefix table. It is session-guarded via
     # if-shell (tmux key tables are server-global), so the menu jump only fires in
     # the owned session and other sessions keep the built-in mark-pane.
-    keys = _q(sock, "list-keys", "-T", "prefix", "m")
+    keys = _prefix_binding(sock, "m")
     assert "select-window" in keys
     assert f"{session}:menu" in keys
     assert "if-shell" in keys

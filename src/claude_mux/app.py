@@ -850,13 +850,27 @@ class ClaudeMuxApp(App):
         tree.clear()
         tree.root.expand()
         restore = None
+        # Each node is built inside its own try/except: this loop runs AFTER
+        # tree.clear(), so a single label builder raising (e.g. an unexpected
+        # transient live-agent/summary state right after a delete) must not abort
+        # the whole rebuild — that would leave the tree wiped and every project
+        # after the failing one missing until the next refresh. Contain the blast
+        # radius to the one bad node so its siblings still render.
         for project in projects:
-            expand = project.root not in self._collapsed_projects
-            pnode = tree.root.add(project_rich_label(project), data=project, expand=expand)
+            try:
+                expand = project.root not in self._collapsed_projects
+                pnode = tree.root.add(
+                    project_rich_label(project), data=project, expand=expand
+                )
+            except Exception:
+                continue
             if selected_project is not None and project.root == selected_project:
                 restore = pnode
             for wt in project.worktrees:
-                wnode = pnode.add_leaf(worktree_rich_label(wt), data=wt)
+                try:
+                    wnode = pnode.add_leaf(worktree_rich_label(wt), data=wt)
+                except Exception:
+                    continue
                 if selected_path is not None and wt.path == selected_path:
                     restore = wnode
 

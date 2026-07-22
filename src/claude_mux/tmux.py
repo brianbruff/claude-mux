@@ -3,10 +3,10 @@
 claude-mux owns ONE dedicated tmux session, ``claude-mux`` (see ADR-0005). Its
 window 0 is the ``menu``: the Textual Project→Worktree tree on the left with a
 plain shell (rooted at the launch directory, ``./``) split off to its right. Each
-entered Worktree is a full-screen window in that same session carrying the three-pane
-Workspace layout: ``claude`` in a left vertical split (~50%), ``yazi`` top-right,
-and a plain shell bottom-right. Navigation is ``select-window`` within the owned
-session — there is no ``switch-client`` to external/per-project sessions.
+entered Worktree is a full-screen window in that same session carrying the default
+Workspace layout: ``claude``/George top-left, ``codex`` bottom-left, ``yazi``
+top-right, and a plain shell bottom-right. Navigation is ``select-window`` within
+the owned session — there is no ``switch-client`` to external/per-project sessions.
 """
 from __future__ import annotations
 

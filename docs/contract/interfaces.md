@@ -126,7 +126,7 @@ class StatusEngine:
 ### activate.py  (the lifecycle primitive; Activate = build Workspace + auto-launch claude)
 ```
 def activate(worktree: Worktree, config: Config, resume: bool = True) -> None
-    # ensure_session; new_window; build_workspace_layout; launch claude in left pane:
+    # ensure_session; new_window; build_workspace_layout; launch claude in first/top-left pane:
     #   resume and worktree.latest_session -> 'claude --resume <session_id>' else config.claude_cmd; then jump_to.
 def new_worktree(project: Project, branch: str, config: Config) -> Worktree
     # git.add_worktree -> Worktree(DORMANT) -> activate(it)
@@ -244,8 +244,8 @@ def in_tmux() -> bool                       # bool(os.environ.get("TMUX"))
 ```
 def open_or_select_workspace(project, worktree, config, resume=True) -> str
     # In the claude-mux session: if a window named '<project>/<branch>' exists, select it;
-    # else create it with build_workspace_layout (claude LEFT | yazi TOP-RIGHT | terminal BOTTOM-RIGHT),
-    # launch claude in the left pane (resume-aware: --resume latest Session else config.claude_cmd).
+    # else create it with build_workspace_layout (claude TOP-LEFT | codex BOTTOM-LEFT | yazi TOP-RIGHT | terminal BOTTOM-RIGHT),
+    # launch claude in the first/top-left pane (resume-aware: --resume latest Session else config.claude_cmd).
     # Then select-window (full-screen) + select-pane the claude pane. Returns the window target.
 # app.action_resume / action_enter call this. No switch-client anywhere here.
 ```

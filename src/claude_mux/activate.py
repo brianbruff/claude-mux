@@ -2,8 +2,9 @@
 
 claude-mux owns ONE tmux session (see ADR-0005 / M9). Each entered Worktree is a
 full-screen window named ``<project>/<branch>`` in that session, carrying the
-three-pane Workspace layout (claude-left / yazi-top-right / shell-bottom-right)
-with ``claude`` auto-launched (resume-aware) in the left pane.
+default Workspace layout (claude/George top-left, codex bottom-left,
+yazi-top-right, shell-bottom-right) with ``claude`` auto-launched
+(resume-aware) in the first pane.
 
 ``open_or_select_workspace`` is the shared primitive: it create-or-selects the
 Worktree's window and ``select-window``s to it (full-screen) — no ``switch-client``.
@@ -58,7 +59,7 @@ def _workspace_window_name(project_name: str, worktree: Worktree) -> str:
 
 
 def _claude_command(worktree: Worktree, config: Config, resume: bool) -> str:
-    """Build the command run in the left pane.
+    """Build the command run in the first/top-left pane.
 
     ``claude_cmd`` [``--model <model>``] [``--resume <session_id>``]. The optional
     ``--model`` pins the model regardless of any enterprise default in the on-disk
@@ -77,7 +78,7 @@ def _open_or_select(project_name: str, worktree: Worktree, config: Config, resum
 
     If a window named ``<project>/<branch>`` already exists, ``select-window`` to
     it (a second entry never spawns a duplicate window/claude). Otherwise build
-    the three-pane layout, launch claude (resume-aware) in the left pane, then
+    the default layout, launch claude (resume-aware) in the first pane, then
     ``select-window`` (full-screen) + ``select-pane`` the claude pane. Returns the
     window target (``@``-prefixed window id). No ``switch-client`` anywhere.
     """

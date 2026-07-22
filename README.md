@@ -18,9 +18,10 @@ See [CONTEXT.md](CONTEXT.md) for the full domain language and
 - **One dedicated `claude-mux` tmux session** — the Claude Squad model (ADR-0005).
   Everything lives inside this single session. **Window 0 is the menu** (this
   Project ▸ Worktree tree). Entering a worktree opens or selects a **full-screen
-  window** in the same session, named `<project>/<branch>`, laid out as `claude`
-  in a left split, `yazi` top-right, and a plain shell bottom-right. tmux is the
-  persistence layer: detaching leaves the menu and every workspace alive.
+  window** in the same session, named `<project>/<branch>`, laid out as
+  `claude`/George top-left, `codex` bottom-left, `yazi` top-right, and a plain
+  shell bottom-right. tmux is the persistence layer: detaching leaves the menu
+  and every workspace alive.
 - **Back to the menu is one keystroke: `prefix + m`** (with the default tmux
   prefix, `Ctrl-b m`). It is a tmux binding, so it works even while focus is in
   the `claude` pane or an editor — not just in the menu. It jumps to the menu
@@ -59,7 +60,7 @@ projects = [                              # the only required setting
 [defaults]
 worktree_pattern = "{repo}.worktrees/{branch}"   # {branch} sanitized: / -> _
 base_branch      = "HEAD"                          # new worktrees branch off this
-claude_cmd       = "claude"                         # command run in the left pane
+claude_cmd       = "claude"                         # command run in the first/top-left pane
 ```
 
 A missing config file is fine — the dashboard just starts with no projects.
@@ -96,8 +97,8 @@ from inside tmux. Re-running it while you are already in the menu is a safe no-o
 
 Once you are in the menu:
 
-- **Enter** a worktree → its full-screen workspace (`claude` left, `yazi`
-  top-right, a shell bottom-right).
+- **Enter** a worktree → its full-screen workspace (`claude`/George top-left,
+  `codex` bottom-left, `yazi` top-right, a shell bottom-right).
 - **`prefix + m`** (e.g. `Ctrl-b m`) → back to the menu, from anywhere, even with
   focus in `claude`.
 - Detach (`prefix + d`) to leave everything running; `uv run claude-mux` re-enters.
