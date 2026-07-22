@@ -6,6 +6,7 @@ from typing import Optional
 
 from pathlib import Path
 
+from claude_mux import tmux as tmux_mod
 from claude_mux.model import AgentKind
 from claude_mux.tmux import (
     PaneInfo,
@@ -208,3 +209,39 @@ def test_cmd_failed_detects_failure_modes():
     assert _cmd_failed(_FakeResult(returncode=1, stderr=[])) is True
     assert _cmd_failed(_FakeResult(returncode=0, stderr=["can't find pane"])) is True
     assert _cmd_failed(None) is True
+
+
+def test_launch_in_pane_reuses_initialized_shell_and_clears_startup_input(monkeypatch):
+    calls: list[tuple] = []
+
+    class FakePane:
+        def send_keys(self, command, enter=False):
+            calls.append(("send_keys", command, enter))
+
+    class FakeServer:
+        panes = None
+
+        def __init__(self):
+            self.panes = self
+
+        def get(self, **kwargs):
+            calls.append(("get", kwargs))
+            return FakePane()
+
+        def cmd(self, *args):
+            calls.append(("cmd", args))
+
+    def fake_launch(server, pane_id, command):
+        calls.append(("launch", server, pane_id, command))
+
+    monkeypatch.setattr(tmux_mod, "_server", FakeServer)
+    monkeypatch.setattr(tmux_mod, "_launch", fake_launch)
+    monkeypatch.setattr(tmux_mod.time, "sleep", lambda seconds: calls.append(("sleep", seconds)))
+
+    tmux_mod.launch_in_pane("%1", "claude", settle=0.15, reuse_shell=True)
+
+    assert calls[0] == ("sleep", 0.15)
+    assert calls[1] == ("get", {"pane_id": "%1", "default": None})
+    assert calls[2] == ("cmd", ("send-keys", "-t", "%1", "C-u"))
+    assert calls[3] == ("send_keys", "claude", True)
+    assert not any(call[0] == "launch" for call in calls)

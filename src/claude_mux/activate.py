@@ -93,22 +93,25 @@ def _open_or_select(project_name: str, worktree: Worktree, config: Config, resum
     claude_cmd = _claude_command(worktree, config, resume)
     plan = layouts.build_plan(config.default_layout, claude_cmd)
     window_target = tmux.new_window(tmux.MUX_SESSION, name, worktree.path)
-    # Build the layout and launch the sibling panes (yazi/shell), but DEFER claude:
-    # its startup terminal-capability handshake (anthropics/claude-code#17787) must
-    # not race the split/select/resize churn, or the churn's DSR replies get read as
-    # pre-typed input (the ``0n0n`` in the prompt).
+    # Build the layout and launch the sibling panes, but DEFER Claude. The initial
+    # shell and prompt theme can emit terminal probes while the panes settle; their
+    # DSR replies must be cleared before Claude can read them as pre-typed ``0n0n``.
     layout = tmux.build_workspace_layout(
         tmux.MUX_SESSION, window_target, worktree.path, plan, launch_first=False
     )
 
     worktree.lifecycle = Lifecycle.LIVE
     # Make the window full-screen and select the claude pane FIRST, so the pane has
-    # its final geometry and the terminal is quiet, THEN launch claude last: the
-    # respawn's ``-k`` flushes any stray replies before claude starts reading.
+    # its final geometry and the terminal is quiet. Launch Claude last through the
+    # pane's existing shell: aliases still work, but .zshrc is not run again and
+    # cannot produce a fresh set of terminal-probe replies.
     tmux.jump_to(tmux.MUX_SESSION, window_target=window_target, pane_id=layout.get("claude"))
     first = plan.panes[0]
     tmux.launch_in_pane(
-        layout[first.role], first.command or "", settle=tmux.CLAUDE_LAUNCH_SETTLE
+        layout[first.role],
+        first.command or "",
+        settle=tmux.CLAUDE_LAUNCH_SETTLE,
+        reuse_shell=True,
     )
     return window_target
 

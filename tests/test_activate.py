@@ -56,9 +56,9 @@ class Recorder:
     def jump_to(self, session_name, window_target=None, pane_id=None):
         self.log.append(("jump_to", session_name, window_target, pane_id))
 
-    def launch_in_pane(self, pane_id, command, settle=0.0):
+    def launch_in_pane(self, pane_id, command, settle=0.0, reuse_shell=False):
         # Claude is launched LAST (after jump_to), into the now-stable pane.
-        self.log.append(("launch_in_pane", pane_id, command, settle))
+        self.log.append(("launch_in_pane", pane_id, command, settle, reuse_shell))
 
     def kill_window(self, session_name, window_target):
         self.log.append(("kill_window", session_name, window_target))
@@ -148,6 +148,7 @@ def test_activate_fresh_when_no_window(wired):
     launch = next(c for c in wired.log if c[0] == "launch_in_pane")
     assert launch[1] == "%1" and launch[2] == "claude"
     assert launch[3] == tmux_mod.CLAUDE_LAUNCH_SETTLE
+    assert launch[4] is True
     assert wt.lifecycle is Lifecycle.LIVE
 
 

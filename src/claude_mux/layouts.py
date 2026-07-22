@@ -9,9 +9,9 @@ by splitting an earlier one (referenced by ``frm``). ``percentage`` is the size
 of the *new* pane (matching libtmux's ``split(percentage=...)``), so a claude
 pane at 40% is expressed as its right-hand neighbour splitting off at 60%.
 
-Commands are plain strings with no shell wrapping — keeping the plan portable and
-unit-testable. Clean launching (execing the program so terminal-query bytes never
-leak into a shell prompt) is the executor's job.
+Commands are plain strings with no shell wrapping, keeping the plan portable and
+unit-testable. Shell reuse, launch ordering and terminal cleanup are the executor's
+job.
 
 Built-in layouts:
   * ``classic`` — claude top-left, codex bottom-left, yazi top-right, shell bottom-right.

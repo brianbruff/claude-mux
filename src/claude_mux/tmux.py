@@ -416,11 +416,11 @@ def _cmd_failed(result: object) -> bool:
     return bool(getattr(result, "stderr", None))
 
 
-# How long to let the terminal quiesce before respawning the claude pane. After
+# How long to let the terminal quiesce before launching in the claude pane. After
 # the layout's splits, sibling launches, ``select-window`` (full-screen resize)
 # and ``select-pane`` are all done, this brief settle lets any query/reply bytes
-# those operations provoked finish arriving in the pane's pty — so the following
-# ``respawn-pane -k`` can discard them before claude starts. See ``launch_in_pane``.
+# those operations provoked finish arriving in the pane's pty so they can be
+# cleared immediately before Claude is typed. See ``launch_in_pane``.
 CLAUDE_LAUNCH_SETTLE = 0.15
 
 
@@ -429,15 +429,11 @@ def _launch(server: libtmux.Server, pane_id: str, command: str) -> None:
 
     ``respawn-pane -k`` replaces the pane's transient shell with the wrapped
     command (see ``launch_command_string``). The ``-k`` kill also discards
-    whatever is buffered in the pane's pty, which is load-bearing for the claude
-    pane: creating the splits and selecting/resizing the window makes tmux emit
-    terminal queries whose ``\\x1b[0n`` (device-status-report) replies land in the
-    pane. Launching claude *last* — after all that churn (see
-    ``build_workspace_layout``'s ``launch_first`` and ``launch_in_pane``) — means
-    ``-k`` flushes those stray replies right before claude starts, so they cannot
-    be read as pre-typed input (``0n0n``). Claude still runs its own startup
-    capability handshake (anthropics/claude-code#17787); that is claude-internal,
-    but it now happens in a quiet, stable, freshly-flushed pty.
+    whatever is buffered in the pane's pty. It is used for non-initial layout
+    panes and as a fallback when an existing pane shell cannot be addressed. The
+    initial Claude pane instead uses :func:`_launch_in_existing_shell`, because
+    starting another interactive shell reruns prompt setup and can generate the
+    ``0n0n`` terminal replies itself.
     Falls back to ``send_keys`` only if the respawn actually failed.
     """
     wrapped = launch_command_string(command)
@@ -457,21 +453,53 @@ def _launch(server: libtmux.Server, pane_id: str, command: str) -> None:
                 pass
 
 
-def launch_in_pane(pane_id: str, command: str, settle: float = 0.0) -> None:
+def _launch_in_existing_shell(server: libtmux.Server, pane_id: str, command: str) -> None:
+    """Launch through the pane's initialized shell without rerunning its rc file.
+
+    The initial pane already contains an interactive shell created by tmux. Its
+    startup theme may issue terminal status queries whose replies are buffered as
+    input (the visible ``0n0n``). Clear that input once, then type the command into
+    the same shell. Reusing it preserves aliases, functions and rc-defined PATH
+    without starting a second interactive shell and generating another probe.
+    """
+    pane = server.panes.get(pane_id=pane_id, default=None)
+    if pane is None:
+        _launch(server, pane_id, command)
+        return
+    try:
+        server.cmd("send-keys", "-t", pane_id, "C-u")
+        pane.send_keys(command, enter=True)
+    except Exception:
+        _launch(server, pane_id, command)
+
+
+def launch_in_pane(
+    pane_id: str,
+    command: str,
+    settle: float = 0.0,
+    reuse_shell: bool = False,
+) -> None:
     """Launch ``command`` in an existing pane, optionally after a settle delay.
 
     Public entry for launching the claude pane *after* the window is full-screen
     and the pane has reached its final geometry (see ``build_workspace_layout``
-    with ``launch_first=False``). ``settle`` sleeps first so the terminal's replies
-    to the preceding split/select/resize churn finish arriving in the pty; the
-    ``respawn-pane -k`` inside ``_launch`` then discards them before claude runs.
+    with ``launch_first=False``). ``settle`` sleeps first so terminal replies from
+    the preceding split/select/resize churn finish arriving in the pty. The normal
+    path then replaces the pane via ``respawn-pane -k``. With ``reuse_shell=True``,
+    the initialized pane shell is retained and its pending input is cleared before
+    typing the command. Claude uses this path so shell startup files are not run a
+    second time and cannot generate a fresh pair of terminal replies.
     A falsy ``command`` is a no-op (the pane stays a plain shell).
     """
     if not command:
         return
+    server = _server()
     if settle and settle > 0:
         time.sleep(settle)
-    _launch(_server(), pane_id, command)
+    if reuse_shell:
+        _launch_in_existing_shell(server, pane_id, command)
+    else:
+        _launch(server, pane_id, command)
 
 
 def build_workspace_layout(
@@ -480,16 +508,16 @@ def build_workspace_layout(
     """Build ``plan``'s split layout in a window; return pane ids keyed by role.
 
     ``plan`` is a ``layouts.LayoutPlan``: ``plan.panes[0]`` is the window's initial
-    pane and each later pane splits off an earlier one. Commands are launched via
-    ``_launch`` (exec, not send-keys) so no terminal-query bytes leak into a pane;
-    a pane whose spec has no command is left as a plain interactive shell. The
-    first pane (claude) is left focused.
+    pane and each later pane splits off an earlier one. Commands launched here use
+    ``_launch``; a pane whose spec has no command is left as a plain interactive
+    shell. The first pane (claude) is left focused.
 
     ``launch_first=False`` builds every pane and launches every *non-first*
     command, but leaves the first pane's command unlaunched so the caller can
     start it last — after ``select-window``/``select-pane`` — via ``launch_in_pane``.
-    This is how the claude pane avoids reading the split/select/resize churn's
-    ``\\x1b[0n`` replies as pre-typed input (``0n0n``); see ``_launch``.
+    This lets the caller settle and clear the first shell's buffered terminal
+    replies before typing Claude, avoiding pre-typed ``0n0n`` input; see
+    ``launch_in_pane``.
     """
     server = _server()
     window = _get_window(server, window_target)
